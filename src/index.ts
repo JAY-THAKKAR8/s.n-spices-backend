@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
+import type { Request, Response, NextFunction } from 'express';
 import publicRoutes from './routes/public.js';
 import adminRoutes from './routes/admin/index.js';
 
@@ -29,8 +30,7 @@ app.use('/api', publicRoutes);
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
 
 // one error handler for all
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const status = err.status || 500;
   if (status >= 500) console.error(err);
   res.status(status).json({ message: status >= 500 ? 'Something went wrong' : err.message });

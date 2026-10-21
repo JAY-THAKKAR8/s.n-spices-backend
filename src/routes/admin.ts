@@ -13,9 +13,9 @@ const r = Router();
 
 // ---------- Auth ----------
 r.post('/login', validate(z.object({ email: z.string().email(), password: z.string().min(1) })), asyncH(async (req, res) => {
-  const a = await one('SELECT * FROM admins WHERE email = $1', [req.body.email.toLowerCase()]);
+  const a: any = await one('SELECT * FROM admins WHERE email = $1', [req.body.email.toLowerCase()]);
   if (!a || !(await bcrypt.compare(req.body.password, a.password))) throw new HttpError(401, 'Wrong email or password');
-  const token = jwt.sign({ id: a.id, role: a.role, name: a.name }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  const token = jwt.sign({ id: a.id, role: a.role, name: a.name }, process.env.JWT_SECRET as string, { expiresIn: '7d' });
   res.json({ token, admin: { id: a.id, name: a.name, email: a.email, role: a.role } });
 }));
 
@@ -38,9 +38,9 @@ r.get('/stats', asyncH(async (_req, res) => {
 const STATUSES = ['PENDING', 'CONFIRMED', 'PACKED', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED'];
 
 r.get('/orders', asyncH(async (req, res) => {
-  const conds = [];
-  const params = [];
-  if (req.query.status && STATUSES.includes(req.query.status)) {
+  const conds: string[] = [];
+  const params: any[] = [];
+  if (req.query.status && STATUSES.includes(req.query.status as string)) {
     params.push(req.query.status);
     conds.push(`o.status = $${params.length}`);
   }
@@ -53,12 +53,12 @@ r.get('/orders', asyncH(async (req, res) => {
 }));
 
 r.patch('/orders/:id', validate(z.object({
-  status: z.enum(STATUSES).optional(),
+  status: z.enum(STATUSES as [string, ...string[]]).optional(),
   paymentStatus: z.enum(['UNPAID', 'PAID', 'REFUNDED']).optional(),
 })), asyncH(async (req, res) => {
   const id = Number(req.params.id);
   await tx(async (db) => {
-    const old = await db.one('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id]);
+    const old: any = await db.one('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id]);
     if (!old) throw new HttpError(404, 'Order not found');
     const { status, paymentStatus } = req.body;
 
@@ -128,7 +128,7 @@ const productSchema = z.object({
   variants: z.array(variantSchema).min(1, 'Add at least one pack size'),
 });
 
-const productCols = (b) => [b.categoryId, b.slug, b.nameEn, b.nameGu || null, b.nameHi || null, b.description || null,
+const productCols = (b: any) => [b.categoryId, b.slug, b.nameEn, b.nameGu || null, b.nameHi || null, b.description || null,
   b.highlight || null, b.origin || null, b.badge || null, b.image || null, b.isFeatured, b.isActive,
   b.botanicalName || null, b.grade || null, b.storage || null, JSON.stringify(b.extraImages), JSON.stringify(b.tags),
   JSON.stringify(b.specs), JSON.stringify(b.tasteNotes), JSON.stringify(b.uses)];
@@ -141,7 +141,7 @@ r.post('/products', validate(productSchema), asyncH(async (req, res) => {
   const b = req.body;
   const id = await tx(async (db) => {
     if (await db.one('SELECT id FROM products WHERE slug = $1', [b.slug])) throw new HttpError(400, 'Slug already used');
-    const p = await db.one(
+    const p: any = await db.one(
       `INSERT INTO products (category_id, slug, name_en, name_gu, name_hi, description, highlight, origin, badge, image, is_featured, is_active,
          botanical_name, grade, storage, images, tags, specs, taste_notes, uses)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
@@ -173,8 +173,8 @@ r.put('/products/:id', validate(productSchema), asyncH(async (req, res) => {
     if (!upd) throw new HttpError(404, 'Product not found');
 
     // packs removed in the form: hide if already in orders, else delete
-    const keep = b.variants.filter((v) => v.id).map((v) => v.id);
-    const removed = await db.q(
+    const keep = b.variants.filter((v: any) => v.id).map((v: any) => v.id);
+    const removed: any[] = await db.q(
       `SELECT v.id, EXISTS (SELECT 1 FROM order_items i WHERE i.variant_id = v.id) AS used
        FROM product_variants v WHERE v.product_id = $1 AND NOT (v.id = ANY($2))`,
       [id, keep],
@@ -213,7 +213,7 @@ const couponSchema = z.object({
   validTill: z.coerce.date().optional().nullable(),
   isActive: z.boolean().default(true),
 });
-const couponVals = (b) => [b.code, b.type, b.value, b.minOrder, b.maxOff ?? null, b.validTill ?? null, b.isActive];
+const couponVals = (b: any) => [b.code, b.type, b.value, b.minOrder, b.maxOff ?? null, b.validTill ?? null, b.isActive];
 
 r.get('/coupons', asyncH(async (_req, res) => {
   res.json(await query('SELECT * FROM coupons ORDER BY id DESC'));

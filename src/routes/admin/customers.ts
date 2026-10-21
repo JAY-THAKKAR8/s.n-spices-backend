@@ -22,7 +22,7 @@ const BASE = `
     GROUP BY c.id
   )`;
 
-const SORTS = {
+const SORTS: Record<string, string> = {
   spent_desc: 'total_spent DESC, id DESC',
   spent_asc: 'total_spent ASC, id DESC',
   recent: 'last_order_at DESC NULLS LAST, id DESC',
@@ -31,10 +31,10 @@ const SORTS = {
   newest: 'created_at DESC',
 };
 
-function filters(qs, vip) {
-  const conds = [];
-  const params = [];
-  const add = (v) => { params.push(v); return `$${params.length}`; };
+function filters(qs: Record<string, any>, vip: number) {
+  const conds: string[] = [];
+  const params: any[] = [];
+  const add = (v: any) => { params.push(v); return `$${params.length}`; };
   if (qs.q) {
     const p = add(`%${String(qs.q).trim()}%`);
     conds.push(`(name ILIKE ${p} OR phone ILIKE ${p} OR email ILIKE ${p} OR city ILIKE ${p})`);
@@ -52,12 +52,12 @@ r.get('/', asyncH(async (req, res) => {
   const { vipSpend } = await getSettings();
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 15));
-  const sort = SORTS[req.query.sort] || SORTS.spent_desc;
+  const sort = SORTS[req.query.sort as string] || SORTS.spent_desc;
   const { where, params } = filters(req.query, vipSpend);
 
   const [items, total, kpis, segs, cities] = await Promise.all([
     query(`${BASE} SELECT * FROM stats WHERE ${where} ORDER BY ${sort} LIMIT ${limit} OFFSET ${(page - 1) * limit}`, params),
-    one(`${BASE} SELECT COUNT(*)::int AS n FROM stats WHERE ${where}`, params),
+    one<{ n: number }>(`${BASE} SELECT COUNT(*)::int AS n FROM stats WHERE ${where}`, params),
     one(`${BASE} SELECT
         COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE created_at >= date_trunc('month', now()))::int AS new_month,
@@ -74,16 +74,16 @@ r.get('/', asyncH(async (req, res) => {
       FROM stats`, [vipSpend]),
     query(`SELECT city, COUNT(DISTINCT customer_id)::int AS n FROM orders GROUP BY city ORDER BY n DESC LIMIT 20`),
   ]);
-  res.json({ items, total: total.n, page, pages: Math.max(1, Math.ceil(total.n / limit)), kpis, segments: segs, cities, vipSpend });
+  res.json({ items, total: total!.n, page, pages: Math.max(1, Math.ceil(total!.n / limit)), kpis, segments: segs, cities, vipSpend });
 }));
 
 r.get('/export.csv', asyncH(async (req, res) => {
   const { vipSpend } = await getSettings();
   const { where, params } = filters(req.query, vipSpend);
-  const rows = await query(`${BASE} SELECT * FROM stats WHERE ${where} ORDER BY total_spent DESC LIMIT 10000`, params);
-  const esc = (x) => `"${String(x ?? '').replace(/"/g, '""')}"`;
+  const rows: any[] = await query(`${BASE} SELECT * FROM stats WHERE ${where} ORDER BY total_spent DESC LIMIT 10000`, params);
+  const esc = (x: any) => `"${String(x ?? '').replace(/"/g, '""')}"`;
   const head = ['Name', 'Phone', 'Email', 'City', 'Pincode', 'Orders', 'Total spent', 'Last order', 'Last order date', 'Customer since'];
-  const d = (x) => (x ? new Date(x).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '');
+  const d = (x: any) => (x ? new Date(x).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '');
   const body = rows.map((c) => [c.name, c.phone, c.email, c.city, c.pincode, c.orderCount, c.totalSpent, c.lastOrderNo, d(c.lastOrderAt), d(c.createdAt)].map(esc).join(','));
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="sn-customers-${new Date().toISOString().slice(0, 10)}.csv"`);
@@ -92,10 +92,10 @@ r.get('/export.csv', asyncH(async (req, res) => {
 
 r.get('/:id', asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  const c = await one(`${BASE} SELECT * FROM stats WHERE id = $1`, [id]);
+  const c: any = await one(`${BASE} SELECT * FROM stats WHERE id = $1`, [id]);
   if (!c) throw new HttpError(404, 'Customer not found');
   const [orders, favourites] = await Promise.all([
-    query(`SELECT id, order_no, total, status, payment_status, payment_method, created_at, address, city, pincode,
+    query<any>(`SELECT id, order_no, total, status, payment_status, payment_method, created_at, address, city, pincode,
              (SELECT COUNT(*)::int FROM order_items i WHERE i.order_id = o.id) AS line_count
            FROM orders o WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50`, [id]),
     query(`SELECT i.name, SUM(i.qty)::int AS qty FROM order_items i JOIN orders o ON o.id = i.order_id

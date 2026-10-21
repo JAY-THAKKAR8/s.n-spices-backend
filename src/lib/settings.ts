@@ -12,26 +12,26 @@ export const SETTING_KEYS = {
   deliveryFee: { env: 'DELIVERY_FEE', def: '40', num: true },
   defaultLowStock: { env: 'DEFAULT_LOW_STOCK', def: '10', num: true },
   vipSpend: { env: 'VIP_SPEND', def: '5000', num: true },
-};
+} as const;
 
-let cache = null;
+let cache: Record<string, any> | null = null;
 let cachedAt = 0;
 
 export async function getSettings() {
   if (cache && Date.now() - cachedAt < 30_000) return cache;
-  const rows = await query('SELECT key, value FROM store_settings');
+  const rows = await query<{ key: string; value: string }>('SELECT key, value FROM store_settings');
   const db = Object.fromEntries(rows.map((r) => [r.key, r.value]));
-  const out = {};
+  const out: Record<string, any> = {};
   for (const [k, c] of Object.entries(SETTING_KEYS)) {
     const raw = db[k] ?? process.env[c.env] ?? c.def;
-    out[k] = c.num ? Number(raw) : raw;
+    out[k] = 'num' in c && c.num ? Number(raw) : raw;
   }
   cache = out;
   cachedAt = Date.now();
   return out;
 }
 
-export async function saveSettings(patch) {
+export async function saveSettings(patch: Record<string, any>) {
   for (const [k, v] of Object.entries(patch)) {
     if (!(k in SETTING_KEYS) || v === undefined) continue;
     await query(

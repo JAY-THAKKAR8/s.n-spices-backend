@@ -5,7 +5,7 @@
 const keep = 'Keep in an airtight jar, away from sunlight and moisture. Use a dry spoon.';
 const nuts = 'Keep in an airtight jar in a cool place. In summer, store in the fridge to keep them crisp.';
 
-export const DETAILS = {
+export const DETAILS: Record<string, Record<string, any>> = {
   'green-cardamom-8mm': {
     botanicalName: 'Elettaria cardamomum',
     grade: '8mm bold green pods',

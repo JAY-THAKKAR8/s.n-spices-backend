@@ -82,22 +82,22 @@ async function main() {
     const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'Admin@123', 10);
     await q(`INSERT INTO admins (name, email, password) VALUES ('Store Admin', $1, $2) ON CONFLICT (email) DO NOTHING`, [email, hash]);
 
-    const catId = {};
+    const catId: Record<string, number> = {};
     for (const [i, c] of categories.entries()) {
-      const row = await one(
+      const row: any = await one(
         `INSERT INTO categories (slug, name_en, name_gu, name_hi, subtitle, tag, image, sort_order)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT (slug) DO UPDATE SET name_en = EXCLUDED.name_en
          RETURNING id`,
         [...c, i + 1],
       );
-      catId[c[0]] = row.id;
+      catId[c[0] as string] = row.id;
     }
 
     for (const p of products) {
       const exists = await one('SELECT id FROM products WHERE slug = $1', [p.slug]);
       if (exists) continue;
-      const row = await one(
+      const row: any = await one(
         `INSERT INTO products (category_id, slug, name_en, name_gu, name_hi, description, highlight, origin, badge, image, is_featured)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
         [catId[p.cat], p.slug, p.en, p.gu, p.hi, p.desc || null, p.hl, p.origin, p.badge, p.image, !!p.featured],

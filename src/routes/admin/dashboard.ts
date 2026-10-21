@@ -51,7 +51,7 @@ r.get('/notifications', asyncH(async (_req, res) => {
            WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold ORDER BY v.stock LIMIT 5`),
     query(`SELECT id, business_name, product, created_at FROM b2b_inquiries WHERE status = 'NEW' ORDER BY created_at DESC LIMIT 5`),
   ]);
-  const counts = await one(`SELECT
+  const counts: any = await one(`SELECT
     (SELECT COUNT(*)::int FROM orders WHERE status = 'PENDING') AS orders,
     (SELECT COUNT(*)::int FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold) AS stock,
     (SELECT COUNT(*)::int FROM b2b_inquiries WHERE status = 'NEW') AS inquiries`);

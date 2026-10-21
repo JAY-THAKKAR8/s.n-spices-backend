@@ -13,9 +13,8 @@ SET sku = 'SN-' || LPAD(v.product_id::text, 3, '0') || '-' || UPPER(REGEXP_REPLA
 WHERE sku IS NULL;
 CREATE UNIQUE INDEX uq_variants_sku ON product_variants(sku) WHERE sku IS NOT NULL;
 
--- Product level
+-- Product level (images already added in 002_product_details.sql)
 ALTER TABLE products
-  ADD COLUMN images   JSONB NOT NULL DEFAULT '[]'::jsonb,  -- extra photos (URLs)
   ADD COLUMN hsn_code VARCHAR(12),
   ADD COLUMN gst_rate NUMERIC(4,2);                        -- e.g. 5.00 (prices include GST)
 

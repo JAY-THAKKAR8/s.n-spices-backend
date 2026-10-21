@@ -25,7 +25,7 @@ const couponSchema = z.object({
   validTill: z.coerce.date().optional().nullable(),
   isActive: z.boolean().default(true),
 }).refine((c) => c.type !== 'PERCENT' || c.value <= 90, { message: 'Percent off must be 90 or less', path: ['value'] });
-const couponVals = (b) => [b.code, b.type, b.value, b.minOrder, b.maxOff ?? null, b.validTill ?? null, b.isActive];
+const couponVals = (b: any) => [b.code, b.type, b.value, b.minOrder, b.maxOff ?? null, b.validTill ?? null, b.isActive];
 
 r.get('/coupons', asyncH(async (_req, res) => {
   res.json(await query(
@@ -55,9 +55,9 @@ r.put('/coupons/:id', validate(couponSchema), asyncH(async (req, res) => {
 
 // ---------- Wholesale (B2B) requests ----------
 r.get('/inquiries', asyncH(async (req, res) => {
-  const params = [];
+  const params: any[] = [];
   let where = 'TRUE';
-  if (['NEW', 'CONTACTED', 'CLOSED'].includes(req.query.status)) { params.push(req.query.status); where = 'status = $1'; }
+  if (['NEW', 'CONTACTED', 'CLOSED'].includes(req.query.status as string)) { params.push(req.query.status); where = 'status = $1'; }
   res.json(await query(`SELECT * FROM b2b_inquiries WHERE ${where} ORDER BY created_at DESC LIMIT 300`, params));
 }));
 

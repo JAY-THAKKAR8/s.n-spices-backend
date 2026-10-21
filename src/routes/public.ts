@@ -44,8 +44,8 @@ const listQuery = z.object({
 r.get('/products', validate(listQuery, 'query'), asyncH(async (req, res) => {
   const { category, q, featured, minPrice, maxPrice, pack, sort, page, limit, lang } = req.validQuery;
   const conds = ['p.is_active'];
-  const params = [];
-  const add = (v) => { params.push(v); return `$${params.length}`; };
+  const params: any[] = [];
+  const add = (v: any) => { params.push(v); return `$${params.length}`; };
 
   if (category && category !== 'all') conds.push(`c.slug = ${add(category)}`);
   if (featured === 'true') conds.push('p.is_featured');
@@ -57,10 +57,10 @@ r.get('/products', validate(listQuery, 'query'), asyncH(async (req, res) => {
   const vc = ['v2.is_active'];
   if (minPrice != null) vc.push(`v2.price >= ${add(minPrice)}`);
   if (maxPrice != null) vc.push(`v2.price <= ${add(maxPrice)}`);
-  if (pack) vc.push(`v2.pack_size = ANY(${add(pack.split(',').map((s) => s.trim()))})`);
+  if (pack) vc.push(`v2.pack_size = ANY(${add(pack.split(',').map((s: string) => s.trim()))})`);
   conds.push(`EXISTS (SELECT 1 FROM product_variants v2 WHERE v2.product_id = p.id AND ${vc.join(' AND ')})`);
 
-  let items = await loadProducts({
+  let items: any[] = await loadProducts({
     where: conds.join(' AND '),
     params,
     orderBy: sort === 'newest' ? 'p.created_at DESC' : 'p.is_featured DESC, p.id ASC',
@@ -76,7 +76,7 @@ r.get('/products', validate(listQuery, 'query'), asyncH(async (req, res) => {
 }));
 
 r.get('/products/:slug', asyncH(async (req, res) => {
-  const lang = req.query.lang || 'en';
+  const lang = (req.query.lang as string) || 'en';
   const [product] = await loadProducts({ where: 'p.slug = $1 AND p.is_active', params: [req.params.slug], lang });
   if (!product) throw new HttpError(404, 'Product not found');
   const related = await loadProducts({
@@ -103,7 +103,7 @@ r.get('/suggestions', asyncH(async (req, res) => {
     where: 'p.is_active AND NOT (p.id = ANY($1))',
     params: [exclude],
     orderBy: 'random()',
-    lang: req.query.lang || 'en',
+    lang: (req.query.lang as string) || 'en',
   });
   res.json(items.slice(0, 3));
 }));
@@ -142,7 +142,7 @@ r.post('/orders', validate(orderBody), asyncH(async (req, res) => {
   const quote = await priceCart(b.items, b.couponCode);
 
   const order = await tx(async (db) => {
-    const customer = await db.one(
+    const customer: any = await db.one(
       `INSERT INTO customers (name, phone) VALUES ($1, $2)
        ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
       [b.name, b.phone],
@@ -157,7 +157,7 @@ r.post('/orders', validate(orderBody), asyncH(async (req, res) => {
       if (!ok) throw new HttpError(409, `${l.name} (${l.packSize}) just went out of stock`);
     }
 
-    const o = await db.one(
+    const o: any = await db.one(
       `INSERT INTO orders (order_no, customer_id, name, phone, address, city, pincode, note,
          subtotal, discount, delivery_fee, total, coupon_id, payment_method)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
@@ -199,7 +199,7 @@ const b2bBody = z.object({
 
 r.post('/b2b-inquiries', validate(b2bBody), asyncH(async (req, res) => {
   const b = req.body;
-  const row = await one(
+  const row: any = await one(
     `INSERT INTO b2b_inquiries (business_name, phone, product, monthly_qty, city_pincode)
      VALUES ($1,$2,$3,$4,$5) RETURNING id`,
     [b.businessName, b.phone, b.product, b.monthlyQty, b.cityPincode],

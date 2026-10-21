@@ -11,7 +11,7 @@ const r = Router();
 r.get('/', asyncH(async (req, res) => {
   // live packs; hidden products still show while they hold stock
   const conds = ['v.is_active AND (p.is_active OR v.stock > 0)'];
-  const params = [];
+  const params: any[] = [];
   if (req.query.q) {
     params.push(`%${req.query.q}%`);
     conds.push(`(p.name_en ILIKE $${params.length} OR v.sku ILIKE $${params.length})`);
@@ -41,7 +41,7 @@ r.get('/', asyncH(async (req, res) => {
 // Stock change log
 r.get('/movements', asyncH(async (req, res) => {
   const limit = Math.min(200, Number(req.query.limit) || 20);
-  const params = [];
+  const params: any[] = [];
   let where = 'TRUE';
   if (req.query.variantId) { params.push(Number(req.query.variantId)); where = `m.variant_id = $1`; }
   res.json(await query(
@@ -67,17 +67,17 @@ r.post('/adjust', validate(adjustBody), asyncH(async (req, res) => {
   const b = req.body;
   if (b.action !== 'SET' && b.qty === 0) throw new HttpError(400, 'Enter quantity more than 0');
   const result = await tx(async (db) => {
-    const v = await db.one('SELECT id, stock FROM product_variants WHERE id = $1 FOR UPDATE', [b.variantId]);
+    const v: any = await db.one('SELECT id, stock FROM product_variants WHERE id = $1 FOR UPDATE', [b.variantId]);
     if (!v) throw new HttpError(404, 'Pack not found');
     let left;
-    if (b.action === 'SET') left = await setStock(db, { variantId: v.id, value: b.qty, type: 'SET', note: b.note || 'Stock count', adminId: req.admin.id });
+    if (b.action === 'SET') left = await setStock(db, { variantId: v.id, value: b.qty, type: 'SET', note: b.note || 'Stock count', adminId: req.admin!.id });
     else {
       left = await moveStock(db, {
         variantId: v.id,
         change: b.action === 'ADD' ? b.qty : -b.qty,
         type: b.action === 'ADD' ? 'INWARD' : 'DEDUCT',
         note: b.note || null,
-        adminId: req.admin.id,
+        adminId: req.admin!.id,
       });
       if (left === null) throw new HttpError(400, `Only ${v.stock} in stock. Cannot remove ${b.qty}.`);
     }
@@ -91,12 +91,12 @@ r.post('/adjust', validate(adjustBody), asyncH(async (req, res) => {
 
 // CSV stock sheet
 r.get('/export.csv', asyncH(async (_req, res) => {
-  const rows = await query(
+  const rows: any[] = await query(
     `SELECT p.name_en, v.pack_size, v.sku, c.name_en AS category, v.stock, v.low_stock_threshold, v.price, v.cost_price
      FROM product_variants v JOIN products p ON p.id = v.product_id JOIN categories c ON c.id = p.category_id
      WHERE v.is_active ORDER BY p.name_en, v.grams`,
   );
-  const esc = (x) => `"${String(x ?? '').replace(/"/g, '""')}"`;
+  const esc = (x: any) => `"${String(x ?? '').replace(/"/g, '""')}"`;
   const head = ['Product', 'Pack', 'SKU', 'Category', 'Stock', 'Alert below', 'Price', 'Cost'];
   const body = rows.map((x) => [x.nameEn, x.packSize, x.sku, x.category, x.stock, x.lowStockThreshold, x.price, x.costPrice].map(esc).join(','));
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
