@@ -2,7 +2,8 @@
 // Safe to run many times (skips rows that exist).
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
-import { pool, tx } from '../src/db.js';
+import { connectDB, disconnectDB, nextId } from '../src/db.js';
+import { Admin, Category, Product, Coupon } from '../src/models/index.js';
 import { DETAILS } from './details.js';
 
 const IMG = 'https://lh3.googleusercontent.com/aida-public/';
@@ -77,53 +78,64 @@ const products = [
 ];
 
 async function main() {
-  await tx(async ({ q, one }) => {
-    const email = (process.env.ADMIN_EMAIL || 'admin@snspices.in').toLowerCase();
+  await connectDB();
+
+  const email = (process.env.ADMIN_EMAIL || 'admin@snspices.in').toLowerCase();
+  if (!(await Admin.exists({ email }))) {
+    const id = await nextId('admin');
     const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'Admin@123', 10);
-    await q(`INSERT INTO admins (name, email, password) VALUES ('Store Admin', $1, $2) ON CONFLICT (email) DO NOTHING`, [email, hash]);
+    await Admin.create({ id, name: 'Store Admin', email, password: hash });
+  }
 
-    const catId: Record<string, number> = {};
-    for (const [i, c] of categories.entries()) {
-      const row: any = await one(
-        `INSERT INTO categories (slug, name_en, name_gu, name_hi, subtitle, tag, image, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT (slug) DO UPDATE SET name_en = EXCLUDED.name_en
-         RETURNING id`,
-        [...c, i + 1],
-      );
-      catId[c[0] as string] = row.id;
+  const catId: Record<string, number> = {};
+  for (const [i, c] of categories.entries()) {
+    const [slug, nameEn, nameGu, nameHi, subtitle, tag, image] = c;
+    let cat = await Category.findOneAndUpdate({ slug }, { $set: { nameEn } }, { new: true });
+    if (!cat) {
+      const id = await nextId('category');
+      cat = await Category.create({ id, slug, nameEn, nameGu, nameHi, subtitle, tag, image, sortOrder: i + 1 });
     }
+    catId[slug] = cat.id;
+  }
 
-    for (const p of products) {
-      const exists = await one('SELECT id FROM products WHERE slug = $1', [p.slug]);
-      if (exists) continue;
-      const row: any = await one(
-        `INSERT INTO products (category_id, slug, name_en, name_gu, name_hi, description, highlight, origin, badge, image, is_featured)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-        [catId[p.cat], p.slug, p.en, p.gu, p.hi, p.desc || null, p.hl, p.origin, p.badge, p.image, !!p.featured],
-      );
-      for (const [packSize, grams, price, mrp] of p.v) {
-        await q('INSERT INTO product_variants (product_id, pack_size, grams, price, mrp) VALUES ($1,$2,$3,$4,$5)', [row.id, packSize, grams, price, mrp]);
-      }
+  for (const p of products) {
+    if (await Product.exists({ slug: p.slug })) continue;
+    const id = await nextId('product');
+    const variants = [];
+    for (const row of p.v) {
+      const [packSize, grams, price, mrp] = row as [string, number, number, number];
+      const variantId = await nextId('variant');
+      variants.push({
+        id: variantId, packSize, grams, price, mrp, stock: 100, lowStockThreshold: 10,
+        sku: `SN-${String(id).padStart(3, '0')}-${packSize.toUpperCase().replace(/[^A-Z0-9]/g, '')}`,
+        isActive: true, updatedAt: new Date(),
+      });
     }
+    await Product.create({
+      id, categoryId: catId[p.cat], slug: p.slug, nameEn: p.en, nameGu: p.gu, nameHi: p.hi,
+      description: p.desc || null, highlight: p.hl, origin: p.origin, badge: p.badge, image: p.image,
+      isFeatured: !!p.featured, variants,
+    });
+  }
 
-    // detail-page content (updates every run)
-    for (const [slug, d] of Object.entries(DETAILS)) {
-      await q(
-        `UPDATE products SET botanical_name = $2, grade = $3, tags = $4, specs = $5, taste_notes = $6, uses = $7, storage = $8,
-           description = COALESCE($9, description), images = $10
-         WHERE slug = $1`,
-        [slug, d.botanicalName || null, d.grade || null, JSON.stringify(d.tags || []), JSON.stringify(d.specs || []),
-          JSON.stringify(d.tasteNotes || []), JSON.stringify(d.uses || []), d.storage || null, d.description || null,
-          JSON.stringify(d.images || [])],
-      );
-    }
+  // detail-page content (updates every run)
+  for (const [slug, d] of Object.entries(DETAILS)) {
+    await Product.updateOne({ slug }, {
+      $set: {
+        botanicalName: d.botanicalName || null, grade: d.grade || null, tags: d.tags || [], specs: d.specs || [],
+        tasteNotes: d.tasteNotes || [], uses: d.uses || [], storage: d.storage || null, images: d.images || [],
+        ...(d.description ? { description: d.description } : {}),
+      },
+    });
+  }
 
-    await q(`INSERT INTO coupons (code, type, value, min_order, max_off) VALUES ('SPICE10','PERCENT',10,499,200) ON CONFLICT (code) DO NOTHING`);
-  });
+  if (!(await Coupon.exists({ code: 'SPICE10' }))) {
+    const id = await nextId('coupon');
+    await Coupon.create({ id, code: 'SPICE10', type: 'PERCENT', value: 10, minOrder: 499, maxOff: 200 });
+  }
   console.log('Seed done.');
 }
 
 main()
   .catch((e) => { console.error(e); process.exitCode = 1; })
-  .finally(() => pool.end());
+  .finally(() => disconnectDB());

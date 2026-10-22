@@ -1,6 +1,7 @@
-import { query } from '../db.js';
+import { StoreSetting } from '../models/index.js';
+import type { StoreSettingDoc } from '../models/index.js';
 
-// Store settings live in the store_settings table. .env gives the first values.
+// Store settings live in the store_settings collection. .env gives the first values.
 export const SETTING_KEYS = {
   storeName: { env: 'STORE_NAME', def: 'S.N Spices' },
   storePhone: { env: 'STORE_WHATSAPP', def: '919601901832' },
@@ -19,7 +20,7 @@ let cachedAt = 0;
 
 export async function getSettings() {
   if (cache && Date.now() - cachedAt < 30_000) return cache;
-  const rows = await query<{ key: string; value: string }>('SELECT key, value FROM store_settings');
+  const rows = await StoreSetting.find().lean<StoreSettingDoc[]>();
   const db = Object.fromEntries(rows.map((r) => [r.key, r.value]));
   const out: Record<string, any> = {};
   for (const [k, c] of Object.entries(SETTING_KEYS)) {
@@ -34,10 +35,7 @@ export async function getSettings() {
 export async function saveSettings(patch: Record<string, any>) {
   for (const [k, v] of Object.entries(patch)) {
     if (!(k in SETTING_KEYS) || v === undefined) continue;
-    await query(
-      'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
-      [k, String(v ?? '')],
-    );
+    await StoreSetting.findOneAndUpdate({ key: k }, { key: k, value: String(v ?? '') }, { upsert: true });
   }
   cache = null;
   return getSettings();

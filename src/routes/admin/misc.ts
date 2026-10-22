@@ -1,18 +1,21 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one } from '../../db.js';
+import { Category, Product, Coupon, B2bInquiry } from '../../models/index.js';
 import { asyncH, HttpError } from '../../lib/utils.js';
 import { validate } from '../../middleware/validate.js';
 import { getSettings, saveSettings } from '../../lib/settings.js';
+import { nextId } from '../../db.js';
 
 const r = Router();
 
 // ---------- Categories ----------
 r.get('/categories', asyncH(async (_req, res) => {
-  res.json(await query(
-    `SELECT c.*, COUNT(p.id)::int AS product_count FROM categories c
-     LEFT JOIN products p ON p.category_id = c.id GROUP BY c.id ORDER BY c.sort_order`,
-  ));
+  const [cats, counts] = await Promise.all([
+    Category.find().sort({ sortOrder: 1 }).lean(),
+    Product.aggregate([{ $group: { _id: '$categoryId', n: { $sum: 1 } } }]),
+  ]);
+  const countById = new Map(counts.map((c) => [c._id, c.n]));
+  res.json(cats.map((c) => ({ ...c, productCount: countById.get(c.id) || 0 })));
 }));
 
 // ---------- Coupons ----------
@@ -25,44 +28,45 @@ const couponSchema = z.object({
   validTill: z.coerce.date().optional().nullable(),
   isActive: z.boolean().default(true),
 }).refine((c) => c.type !== 'PERCENT' || c.value <= 90, { message: 'Percent off must be 90 or less', path: ['value'] });
-const couponVals = (b: any) => [b.code, b.type, b.value, b.minOrder, b.maxOff ?? null, b.validTill ?? null, b.isActive];
+const couponSet = (b: any) => ({ code: b.code, type: b.type, value: b.value, minOrder: b.minOrder, maxOff: b.maxOff ?? null, validTill: b.validTill ?? null, isActive: b.isActive });
 
 r.get('/coupons', asyncH(async (_req, res) => {
-  res.json(await query(
-    `SELECT c.*, COUNT(o.id)::int AS used, COALESCE(SUM(o.discount),0) AS discount_given
-     FROM coupons c LEFT JOIN orders o ON o.coupon_id = c.id AND o.status <> 'CANCELLED'
-     GROUP BY c.id ORDER BY c.id DESC`,
-  ));
+  const rows = await Coupon.aggregate([
+    { $lookup: {
+      from: 'orders', let: { cid: '$id' },
+      pipeline: [{ $match: { $expr: { $and: [{ $eq: ['$couponId', '$$cid'] }, { $ne: ['$status', 'CANCELLED'] }] } } }],
+      as: 'orders',
+    } },
+    { $addFields: { used: { $size: '$orders' }, discountGiven: { $sum: '$orders.discount' } } },
+    { $project: { orders: 0 } },
+    { $sort: { id: -1 } },
+  ]);
+  res.json(rows);
 }));
 
 r.post('/coupons', validate(couponSchema), asyncH(async (req, res) => {
-  if (await one('SELECT id FROM coupons WHERE code = $1', [req.body.code])) throw new HttpError(400, 'Code already exists');
-  res.status(201).json(await one(
-    'INSERT INTO coupons (code, type, value, min_order, max_off, valid_till, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-    couponVals(req.body),
-  ));
+  if (await Coupon.exists({ code: req.body.code })) throw new HttpError(400, 'Code already exists');
+  const id = await nextId('coupon');
+  res.status(201).json(await Coupon.create({ id, ...couponSet(req.body) }));
 }));
 
 r.put('/coupons/:id', validate(couponSchema), asyncH(async (req, res) => {
-  if (await one('SELECT id FROM coupons WHERE code = $1 AND id <> $2', [req.body.code, Number(req.params.id)])) throw new HttpError(400, 'Code already exists');
-  const row = await one(
-    'UPDATE coupons SET code=$1, type=$2, value=$3, min_order=$4, max_off=$5, valid_till=$6, is_active=$7 WHERE id=$8 RETURNING *',
-    [...couponVals(req.body), Number(req.params.id)],
-  );
+  const id = Number(req.params.id);
+  if (await Coupon.exists({ code: req.body.code, id: { $ne: id } })) throw new HttpError(400, 'Code already exists');
+  const row = await Coupon.findOneAndUpdate({ id }, { $set: couponSet(req.body) }, { new: true });
   if (!row) throw new HttpError(404, 'Coupon not found');
   res.json(row);
 }));
 
 // ---------- Wholesale (B2B) requests ----------
 r.get('/inquiries', asyncH(async (req, res) => {
-  const params: any[] = [];
-  let where = 'TRUE';
-  if (['NEW', 'CONTACTED', 'CLOSED'].includes(req.query.status as string)) { params.push(req.query.status); where = 'status = $1'; }
-  res.json(await query(`SELECT * FROM b2b_inquiries WHERE ${where} ORDER BY created_at DESC LIMIT 300`, params));
+  const filter: Record<string, any> = {};
+  if (['NEW', 'CONTACTED', 'CLOSED'].includes(req.query.status as string)) filter.status = req.query.status;
+  res.json(await B2bInquiry.find(filter).sort({ createdAt: -1 }).limit(300).lean());
 }));
 
 r.patch('/inquiries/:id', validate(z.object({ status: z.enum(['NEW', 'CONTACTED', 'CLOSED']) })), asyncH(async (req, res) => {
-  const row = await one('UPDATE b2b_inquiries SET status = $1 WHERE id = $2 RETURNING *', [req.body.status, Number(req.params.id)]);
+  const row = await B2bInquiry.findOneAndUpdate({ id: Number(req.params.id) }, { $set: { status: req.body.status } }, { new: true });
   if (!row) throw new HttpError(404, 'Not found');
   res.json(row);
 }));

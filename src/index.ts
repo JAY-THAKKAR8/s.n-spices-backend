@@ -7,9 +7,14 @@ import rateLimit from 'express-rate-limit';
 import type { Request, Response, NextFunction } from 'express';
 import publicRoutes from './routes/public.js';
 import adminRoutes from './routes/admin/index.js';
+import { connectDB } from './db.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('JWT_SECRET missing in .env');
+  process.exit(1);
+}
+if (!process.env.MONGODB_URI) {
+  console.error('MONGODB_URI missing in .env');
   process.exit(1);
 }
 
@@ -37,4 +42,9 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 const port = Number(process.env.PORT || 5001);
-app.listen(port, () => console.log(`API running on http://localhost:${port}`));
+connectDB()
+  .then(() => app.listen(port, () => console.log(`API running on http://localhost:${port}`)))
+  .catch((e) => {
+    console.error('MongoDB connection failed:', e.message);
+    process.exit(1);
+  });

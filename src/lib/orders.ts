@@ -1,9 +1,8 @@
-import { query } from '../db.js';
+import type { QueryFilter } from 'mongoose';
+import { Order } from '../models/index.js';
+import type { OrderDoc } from '../models/index.js';
 
-// Load orders with their items. where uses alias o.
-export async function loadOrders(where = 'TRUE', params: any[] = [], limit = 200) {
-  const orders = await query(`SELECT o.* FROM orders o WHERE ${where} ORDER BY o.created_at DESC LIMIT ${Number(limit)}`, params);
-  if (!orders.length) return [];
-  const items = await query('SELECT * FROM order_items WHERE order_id = ANY($1) ORDER BY id', [orders.map((o: any) => o.id)]);
-  return orders.map((o: any) => ({ ...o, items: items.filter((i: any) => i.orderId === o.id) }));
+// Load orders (items are already embedded on each order doc).
+export async function loadOrders(filter: QueryFilter<OrderDoc> = {}, limit = 200) {
+  return Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean<OrderDoc[]>();
 }

@@ -21,12 +21,12 @@ export const money = (n: number): number => Math.round(Number(n) * 100) / 100;
 export const shapeProduct = (p: Record<string, any>, lang = 'en') => {
   const variants = (p.variants || []).map((v: Record<string, any>) => ({
     id: v.id,
-    packSize: v.pack_size ?? v.packSize,
+    packSize: v.packSize,
     grams: v.grams,
     price: Number(v.price),
     mrp: Number(v.mrp),
     stock: v.stock,
-    isActive: v.is_active ?? v.isActive,
+    isActive: v.isActive,
   }));
   const first = variants[0];
   // Admin edits content into `details` (+ scientificName). Older seed data lives in

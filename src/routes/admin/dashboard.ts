@@ -1,60 +1,120 @@
 import { Router } from 'express';
-import { query, one } from '../../db.js';
+import { Order, Product, Customer, B2bInquiry } from '../../models/index.js';
 import { asyncH } from '../../lib/utils.js';
 
 const r = Router();
 
-// Dashboard numbers. "Today" uses the database server time zone.
-r.get('/stats', asyncH(async (_req, res) => {
-  const [k, days, recent, lowStockItems, top] = await Promise.all([
-    one(`SELECT
-      (SELECT COALESCE(SUM(total),0) FROM orders WHERE created_at >= CURRENT_DATE AND status <> 'CANCELLED') AS sales_today,
-      (SELECT COALESCE(SUM(total),0) FROM orders WHERE created_at >= CURRENT_DATE - 1 AND created_at < CURRENT_DATE AND status <> 'CANCELLED') AS sales_yesterday,
-      (SELECT COUNT(*)::int FROM orders WHERE created_at >= CURRENT_DATE) AS orders_today,
-      (SELECT COUNT(*)::int FROM orders WHERE created_at >= CURRENT_DATE - 1 AND created_at < CURRENT_DATE) AS orders_yesterday,
-      (SELECT COUNT(*)::int FROM orders WHERE status = 'PENDING') AS new_orders,
-      (SELECT COUNT(*)::int FROM orders WHERE status IN ('CONFIRMED','PACKED')) AS to_pack,
-      (SELECT COUNT(*)::int FROM orders WHERE status = 'OUT_FOR_DELIVERY') AS out_for_delivery,
-      (SELECT COALESCE(SUM(total),0) FROM orders WHERE payment_status = 'UNPAID' AND status NOT IN ('CANCELLED')) AS unpaid_amount,
-      (SELECT COUNT(*)::int FROM orders WHERE payment_status = 'UNPAID' AND status NOT IN ('CANCELLED')) AS unpaid_orders,
-      (SELECT COALESCE(SUM(total),0) FROM orders WHERE created_at >= date_trunc('month', now()) AND status <> 'CANCELLED') AS sales_month,
-      (SELECT COUNT(*)::int FROM b2b_inquiries WHERE status = 'NEW') AS new_inquiries,
-      (SELECT COUNT(*)::int FROM product_variants v JOIN products p ON p.id = v.product_id
-         WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold) AS low_stock,
-      (SELECT COUNT(*)::int FROM customers) AS customers`),
-    query(`SELECT to_char(d, 'YYYY-MM-DD') AS day,
-             COALESCE(SUM(o.total) FILTER (WHERE o.status <> 'CANCELLED'), 0) AS sales,
-             COUNT(o.id)::int AS orders
-           FROM generate_series(CURRENT_DATE - 6, CURRENT_DATE, interval '1 day') d
-           LEFT JOIN orders o ON o.created_at >= d AND o.created_at < d + interval '1 day'
-           GROUP BY d ORDER BY d`),
-    query(`SELECT o.id, o.order_no, o.name, o.city, o.total, o.status, o.payment_method, o.payment_status, o.created_at,
-             (SELECT COUNT(*)::int FROM order_items i WHERE i.order_id = o.id) AS item_count
-           FROM orders o ORDER BY o.created_at DESC LIMIT 6`),
-    query(`SELECT v.id, v.pack_size, v.stock, v.low_stock_threshold, v.sku, p.name_en AS product, p.id AS product_id
-           FROM product_variants v JOIN products p ON p.id = v.product_id
-           WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold
-           ORDER BY v.stock ASC LIMIT 6`),
-    query(`SELECT i.name, i.pack_size, SUM(i.qty)::int AS qty, SUM(i.line_total) AS revenue
-           FROM order_items i JOIN orders o ON o.id = i.order_id
-           WHERE o.status <> 'CANCELLED' AND o.created_at >= now() - interval '30 days'
-           GROUP BY i.name, i.pack_size ORDER BY revenue DESC LIMIT 5`),
+const LOW_STOCK_MATCH = { 'variants.isActive': true, $expr: { $lte: ['$variants.stock', '$variants.lowStockThreshold'] } };
+
+async function lowStockCount() {
+  const [row] = await Product.aggregate([
+    { $match: { isActive: true } },
+    { $unwind: '$variants' },
+    { $match: LOW_STOCK_MATCH },
+    { $count: 'n' },
   ]);
-  res.json({ ...k, days, recent, lowStockItems, top });
+  return row?.n || 0;
+}
+
+// Dashboard numbers. "Today" is midnight UTC, same cutoff used everywhere here.
+r.get('/stats', asyncH(async (_req, res) => {
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const sevenStart = new Date(todayStart.getTime() - 6 * 24 * 60 * 60 * 1000);
+  const thirtyAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  const sumSince = (gte: Date, lt?: Date) =>
+    Order.aggregate([
+      { $match: { createdAt: lt ? { $gte: gte, $lt: lt } : { $gte: gte }, status: { $ne: 'CANCELLED' } } },
+      { $group: { _id: null, sum: { $sum: '$total' } } },
+    ]).then((r) => r[0]?.sum || 0);
+
+  const [
+    salesToday, salesYesterday, ordersToday, ordersYesterday, newOrders, toPack, outForDelivery,
+    unpaid, salesMonth, newInquiries, lowStock, customers, dayAgg, recentOrders, lowStockItems, top,
+  ] = await Promise.all([
+    sumSince(todayStart),
+    sumSince(yesterdayStart, todayStart),
+    Order.countDocuments({ createdAt: { $gte: todayStart } }),
+    Order.countDocuments({ createdAt: { $gte: yesterdayStart, $lt: todayStart } }),
+    Order.countDocuments({ status: 'PENDING' }),
+    Order.countDocuments({ status: { $in: ['CONFIRMED', 'PACKED'] } }),
+    Order.countDocuments({ status: 'OUT_FOR_DELIVERY' }),
+    Order.aggregate([
+      { $match: { paymentStatus: 'UNPAID', status: { $ne: 'CANCELLED' } } },
+      { $group: { _id: null, sum: { $sum: '$total' }, n: { $sum: 1 } } },
+    ]).then((r) => r[0] || { sum: 0, n: 0 }),
+    sumSince(monthStart),
+    B2bInquiry.countDocuments({ status: 'NEW' }),
+    lowStockCount(),
+    Customer.countDocuments(),
+    Order.aggregate([
+      { $match: { createdAt: { $gte: sevenStart } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'UTC' } },
+          sales: { $sum: { $cond: [{ $ne: ['$status', 'CANCELLED'] }, '$total', 0] } },
+          orders: { $sum: 1 },
+        },
+      },
+    ]),
+    Order.find({}, { id: 1, orderNo: 1, name: 1, city: 1, total: 1, status: 1, paymentMethod: 1, paymentStatus: 1, createdAt: 1, items: 1 })
+      .sort({ createdAt: -1 }).limit(6).lean(),
+    Product.aggregate([
+      { $match: { isActive: true } },
+      { $unwind: '$variants' },
+      { $match: LOW_STOCK_MATCH },
+      { $project: { _id: 0, id: '$variants.id', packSize: '$variants.packSize', stock: '$variants.stock', lowStockThreshold: '$variants.lowStockThreshold', sku: '$variants.sku', product: '$nameEn', productId: '$id' } },
+      { $sort: { stock: 1 } },
+      { $limit: 6 },
+    ]),
+    Order.aggregate([
+      { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: thirtyAgo } } },
+      { $unwind: '$items' },
+      { $group: { _id: { name: '$items.name', packSize: '$items.packSize' }, qty: { $sum: '$items.qty' }, revenue: { $sum: '$items.lineTotal' } } },
+      { $sort: { revenue: -1 } },
+      { $limit: 5 },
+      { $project: { _id: 0, name: '$_id.name', packSize: '$_id.packSize', qty: 1, revenue: 1 } },
+    ]),
+  ]);
+
+  const dayMap = new Map(dayAgg.map((d: any) => [d._id, d]));
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(sevenStart.getTime() + i * 24 * 60 * 60 * 1000);
+    const key = d.toISOString().slice(0, 10);
+    const row = dayMap.get(key);
+    days.push({ day: key, sales: row?.sales || 0, orders: row?.orders || 0 });
+  }
+  const recent = recentOrders.map((o) => ({ ...o, itemCount: o.items.length, items: undefined }));
+
+  res.json({
+    salesToday, salesYesterday, ordersToday, ordersYesterday, newOrders, toPack, outForDelivery,
+    unpaidAmount: unpaid.sum, unpaidOrders: unpaid.n, salesMonth, newInquiries, lowStock, customers,
+    days, recent, lowStockItems, top,
+  });
 }));
 
 // Bell icon: things that need attention
 r.get('/notifications', asyncH(async (_req, res) => {
-  const [orders, stock, inquiries] = await Promise.all([
-    query(`SELECT id, order_no, name, total, created_at FROM orders WHERE status = 'PENDING' ORDER BY created_at DESC LIMIT 5`),
-    query(`SELECT v.id, v.pack_size, v.stock, p.name_en AS product FROM product_variants v JOIN products p ON p.id = v.product_id
-           WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold ORDER BY v.stock LIMIT 5`),
-    query(`SELECT id, business_name, product, created_at FROM b2b_inquiries WHERE status = 'NEW' ORDER BY created_at DESC LIMIT 5`),
+  const [orders, stock, inquiries, orderCount, stockCount, inquiryCount] = await Promise.all([
+    Order.find({ status: 'PENDING' }, { id: 1, orderNo: 1, name: 1, total: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(5).lean(),
+    Product.aggregate([
+      { $match: { isActive: true } },
+      { $unwind: '$variants' },
+      { $match: LOW_STOCK_MATCH },
+      { $project: { _id: 0, id: '$variants.id', packSize: '$variants.packSize', stock: '$variants.stock', product: '$nameEn' } },
+      { $sort: { stock: 1 } },
+      { $limit: 5 },
+    ]),
+    B2bInquiry.find({ status: 'NEW' }, { id: 1, businessName: 1, product: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(5).lean(),
+    Order.countDocuments({ status: 'PENDING' }),
+    lowStockCount(),
+    B2bInquiry.countDocuments({ status: 'NEW' }),
   ]);
-  const counts: any = await one(`SELECT
-    (SELECT COUNT(*)::int FROM orders WHERE status = 'PENDING') AS orders,
-    (SELECT COUNT(*)::int FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.is_active AND p.is_active AND v.stock <= v.low_stock_threshold) AS stock,
-    (SELECT COUNT(*)::int FROM b2b_inquiries WHERE status = 'NEW') AS inquiries`);
+  const counts = { orders: orderCount, stock: stockCount, inquiries: inquiryCount };
   res.json({ counts, total: counts.orders + counts.stock + counts.inquiries, orders, stock, inquiries });
 }));
 
@@ -62,13 +122,12 @@ r.get('/notifications', asyncH(async (_req, res) => {
 r.get('/search', asyncH(async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (q.length < 2) return res.json({ orders: [], products: [], customers: [] });
-  const like = `%${q}%`;
+  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
   const [orders, products, customers] = await Promise.all([
-    query(`SELECT id, order_no, name, total, status FROM orders
-           WHERE order_no ILIKE $1 OR phone ILIKE $1 OR name ILIKE $1 ORDER BY created_at DESC LIMIT 5`, [like]),
-    query(`SELECT DISTINCT p.id, p.name_en, p.slug FROM products p LEFT JOIN product_variants v ON v.product_id = p.id
-           WHERE p.name_en ILIKE $1 OR p.name_gu ILIKE $1 OR p.name_hi ILIKE $1 OR v.sku ILIKE $1 LIMIT 5`, [like]),
-    query(`SELECT id, name, phone FROM customers WHERE name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1 LIMIT 5`, [like]),
+    Order.find({ $or: [{ orderNo: re }, { phone: re }, { name: re }] }, { id: 1, orderNo: 1, name: 1, total: 1, status: 1 })
+      .sort({ createdAt: -1 }).limit(5).lean(),
+    Product.find({ $or: [{ nameEn: re }, { nameGu: re }, { nameHi: re }, { 'variants.sku': re }] }, { id: 1, nameEn: 1, slug: 1 }).limit(5).lean(),
+    Customer.find({ $or: [{ name: re }, { phone: re }, { email: re }] }, { id: 1, name: 1, phone: 1 }).limit(5).lean(),
   ]);
   res.json({ orders, products, customers });
 }));

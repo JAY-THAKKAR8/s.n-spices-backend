@@ -1,35 +1,37 @@
-import { query } from '../db.js';
+import type { QueryFilter, SortOrder } from 'mongoose';
+import { Product, Category } from '../models/index.js';
+import type { ProductDoc, CategoryDoc } from '../models/index.js';
 import { shapeProduct } from './utils.js';
 
 export interface LoadProductsOptions {
-  where?: string;
-  params?: any[];
-  orderBy?: string;
+  filter?: QueryFilter<ProductDoc>;
+  sort?: Record<string, SortOrder>;
   onlyActiveVariants?: boolean;
   lang?: string;
-  admin?: boolean;
 }
 
-// Load products with their variants in one query.
-// where: SQL after WHERE using alias p (products) and c (categories).
-// onlyActiveVariants: hide inactive packs (shop side).
+// Load products (with their variants already embedded) and attach category info.
 export async function loadProducts({
-  where = 'TRUE',
-  params = [],
-  orderBy = 'p.is_featured DESC, p.id ASC',
+  filter = {},
+  sort = { isFeatured: -1, id: 1 },
   onlyActiveVariants = true,
   lang = 'en',
 }: LoadProductsOptions = {}) {
-  const rows = await query(
-    `SELECT p.*, c.slug AS category_slug, c.name_en AS category_name,
-       COALESCE(json_agg(v ORDER BY v.grams, v.id) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants
-     FROM products p
-     JOIN categories c ON c.id = p.category_id
-     LEFT JOIN product_variants v ON v.product_id = p.id ${onlyActiveVariants ? 'AND v.is_active' : ''}
-     WHERE ${where}
-     GROUP BY p.id, c.slug, c.name_en
-     ORDER BY ${orderBy}`,
-    params,
-  );
-  return rows.map((p: any) => shapeProduct(p, lang));
+  const docs = await Product.find(filter).sort(sort).lean<ProductDoc[]>();
+  const categories = await Category.find({}, { id: 1, slug: 1, nameEn: 1 }).lean<CategoryDoc[]>();
+  const catById = new Map(categories.map((c) => [c.id, c]));
+
+  return docs.map((p) => {
+    const cat = catById.get(p.categoryId);
+    const variants = onlyActiveVariants ? p.variants.filter((v) => v.isActive) : p.variants;
+    return shapeProduct(
+      {
+        ...p,
+        variants: [...variants].sort((a, b) => a.grams - b.grams || a.id - b.id),
+        categorySlug: cat?.slug,
+        categoryName: cat?.nameEn,
+      },
+      lang,
+    );
+  });
 }

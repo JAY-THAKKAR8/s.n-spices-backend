@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one, tx } from '../db.js';
+import { Category, Product, Order, Customer, B2bInquiry } from '../models/index.js';
+import { tx, nextId } from '../db.js';
 import { asyncH, HttpError, makeOrderNo } from '../lib/utils.js';
 import { loadProducts } from '../lib/products.js';
 import { loadOrders } from '../lib/orders.js';
@@ -20,11 +21,12 @@ r.get('/settings', (_req, res) => {
 
 // ---------- Categories ----------
 r.get('/categories', asyncH(async (_req, res) => {
-  res.json(await query(
-    `SELECT c.*, COUNT(p.id)::int AS product_count
-     FROM categories c LEFT JOIN products p ON p.category_id = c.id AND p.is_active
-     WHERE c.is_active GROUP BY c.id ORDER BY c.sort_order`,
-  ));
+  const [cats, counts] = await Promise.all([
+    Category.find({ isActive: true }).sort({ sortOrder: 1 }).lean(),
+    Product.aggregate([{ $match: { isActive: true } }, { $group: { _id: '$categoryId', n: { $sum: 1 } } }]),
+  ]);
+  const countById = new Map(counts.map((c) => [c._id, c.n]));
+  res.json(cats.map((c) => ({ ...c, productCount: countById.get(c.id) || 0 })));
 }));
 
 // ---------- Products ----------
@@ -43,27 +45,27 @@ const listQuery = z.object({
 
 r.get('/products', validate(listQuery, 'query'), asyncH(async (req, res) => {
   const { category, q, featured, minPrice, maxPrice, pack, sort, page, limit, lang } = req.validQuery;
-  const conds = ['p.is_active'];
-  const params: any[] = [];
-  const add = (v: any) => { params.push(v); return `$${params.length}`; };
+  const filter: Record<string, any> = { isActive: true };
 
-  if (category && category !== 'all') conds.push(`c.slug = ${add(category)}`);
-  if (featured === 'true') conds.push('p.is_featured');
+  if (category && category !== 'all') {
+    const cat = await Category.findOne({ slug: category }).lean();
+    filter.categoryId = cat ? cat.id : -1;
+  }
+  if (featured === 'true') filter.isFeatured = true;
   if (q) {
-    const like = add(`%${q}%`);
-    conds.push(`(p.name_en ILIKE ${like} OR p.name_gu ILIKE ${like} OR p.name_hi ILIKE ${like} OR p.highlight ILIKE ${like})`);
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    filter.$or = [{ nameEn: re }, { nameGu: re }, { nameHi: re }, { highlight: re }];
   }
   // product must have at least one pack that matches price/pack filters
-  const vc = ['v2.is_active'];
-  if (minPrice != null) vc.push(`v2.price >= ${add(minPrice)}`);
-  if (maxPrice != null) vc.push(`v2.price <= ${add(maxPrice)}`);
-  if (pack) vc.push(`v2.pack_size = ANY(${add(pack.split(',').map((s: string) => s.trim()))})`);
-  conds.push(`EXISTS (SELECT 1 FROM product_variants v2 WHERE v2.product_id = p.id AND ${vc.join(' AND ')})`);
+  const vm: Record<string, any> = { isActive: true };
+  if (minPrice != null) vm.price = { ...vm.price, $gte: minPrice };
+  if (maxPrice != null) vm.price = { ...vm.price, $lte: maxPrice };
+  if (pack) vm.packSize = { $in: pack.split(',').map((s: string) => s.trim()) };
+  filter.variants = { $elemMatch: vm };
 
   let items: any[] = await loadProducts({
-    where: conds.join(' AND '),
-    params,
-    orderBy: sort === 'newest' ? 'p.created_at DESC' : 'p.is_featured DESC, p.id ASC',
+    filter,
+    sort: sort === 'newest' ? { createdAt: -1 } : { isFeatured: -1, id: 1 },
     lang,
   });
   if (sort === 'price_asc') items.sort((a, b) => a.minPrice - b.minPrice);
@@ -77,18 +79,16 @@ r.get('/products', validate(listQuery, 'query'), asyncH(async (req, res) => {
 
 r.get('/products/:slug', asyncH(async (req, res) => {
   const lang = (req.query.lang as string) || 'en';
-  const [product] = await loadProducts({ where: 'p.slug = $1 AND p.is_active', params: [req.params.slug], lang });
+  const [product] = await loadProducts({ filter: { slug: req.params.slug, isActive: true }, lang });
   if (!product) throw new HttpError(404, 'Product not found');
   const related = await loadProducts({
-    where: 'p.category_id = $1 AND p.id <> $2 AND p.is_active',
-    params: [product.categoryId, product.id],
+    filter: { categoryId: product.categoryId, id: { $ne: product.id }, isActive: true },
     lang,
   });
   // small category? fill with best sellers from other categories
   if (related.length < 4) {
     const more = await loadProducts({
-      where: 'p.is_active AND p.is_featured AND p.id <> $1 AND p.category_id <> $2',
-      params: [product.id, product.categoryId],
+      filter: { isActive: true, isFeatured: true, id: { $ne: product.id }, categoryId: { $ne: product.categoryId } },
       lang,
     });
     related.push(...more);
@@ -100,11 +100,14 @@ r.get('/products/:slug', asyncH(async (req, res) => {
 r.get('/suggestions', asyncH(async (req, res) => {
   const exclude = String(req.query.exclude || '').split(',').map(Number).filter(Boolean);
   const items = await loadProducts({
-    where: 'p.is_active AND NOT (p.id = ANY($1))',
-    params: [exclude],
-    orderBy: 'random()',
+    filter: { isActive: true, id: { $nin: exclude } },
     lang: (req.query.lang as string) || 'en',
   });
+  // shuffle, then take 3 (category list is small, so this stays cheap)
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
   res.json(items.slice(0, 3));
 }));
 
@@ -141,39 +144,59 @@ r.post('/orders', validate(orderBody), asyncH(async (req, res) => {
   const b = req.body;
   const quote = await priceCart(b.items, b.couponCode);
 
-  const order = await tx(async (db) => {
-    const customer: any = await db.one(
-      `INSERT INTO customers (name, phone) VALUES ($1, $2)
-       ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
-      [b.name, b.phone],
+  const order = await tx(async (session) => {
+    let customer = await Customer.findOneAndUpdate(
+      { phone: b.phone },
+      { $set: { name: b.name } },
+      { new: true, session },
     );
+    if (!customer) {
+      const customerId = await nextId('customer', session);
+      [customer] = await Customer.create([{ id: customerId, name: b.name, phone: b.phone }], { session });
+    }
 
     // take stock; fail if someone bought it first
     for (const l of quote.lines) {
-      const ok = await db.one(
-        'UPDATE product_variants SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING id',
-        [l.qty, l.variantId],
+      const ok = await Product.findOneAndUpdate(
+        { 'variants.id': l.variantId, 'variants.stock': { $gte: l.qty } },
+        { $inc: { 'variants.$.stock': -l.qty } },
+        { session },
       );
       if (!ok) throw new HttpError(409, `${l.name} (${l.packSize}) just went out of stock`);
     }
 
-    const o: any = await db.one(
-      `INSERT INTO orders (order_no, customer_id, name, phone, address, city, pincode, note,
-         subtotal, discount, delivery_fee, total, coupon_id, payment_method)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-      [makeOrderNo(), customer.id, b.name, b.phone, b.address, b.city, b.pincode, b.note || null,
-        quote.subtotal, quote.discount, quote.deliveryFee, quote.total, quote.coupon?.id ?? null, b.paymentMethod],
+    const orderId = await nextId('order', session);
+    const items = quote.lines.map((l, i) => ({
+      id: i + 1,
+      variantId: l.variantId,
+      name: l.name,
+      packSize: l.packSize,
+      price: l.price,
+      qty: l.qty,
+      lineTotal: l.lineTotal,
+    }));
+    const [o] = await Order.create(
+      [{
+        id: orderId,
+        orderNo: makeOrderNo(),
+        customerId: customer.id,
+        name: b.name,
+        phone: b.phone,
+        address: b.address,
+        city: b.city,
+        pincode: b.pincode,
+        note: b.note || null,
+        subtotal: quote.subtotal,
+        discount: quote.discount,
+        deliveryFee: quote.deliveryFee,
+        total: quote.total,
+        couponId: quote.coupon?.id ?? null,
+        paymentMethod: b.paymentMethod,
+        items,
+      }],
+      { session },
     );
-
-    o.items = [];
-    for (const l of quote.lines) {
-      o.items.push(await db.one(
-        `INSERT INTO order_items (order_id, variant_id, name, pack_size, price, qty, line_total)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [o.id, l.variantId, l.name, l.packSize, l.price, l.qty, l.lineTotal],
-      ));
-    }
-    return o;
+    return o.toObject();
   });
 
   res.status(201).json(order);
@@ -183,7 +206,7 @@ r.post('/orders', validate(orderBody), asyncH(async (req, res) => {
 r.get('/orders/track', asyncH(async (req, res) => {
   const { orderNo, phone } = req.query;
   if (!orderNo || !phone) throw new HttpError(400, 'Order number and phone needed');
-  const [o] = await loadOrders('o.order_no = $1 AND o.phone = $2', [String(orderNo).trim().toUpperCase(), String(phone).trim()], 1);
+  const [o] = await loadOrders({ orderNo: String(orderNo).trim().toUpperCase(), phone: String(phone).trim() }, 1);
   if (!o) throw new HttpError(404, 'Order not found. Check order number and phone.');
   res.json(o);
 }));
@@ -199,11 +222,10 @@ const b2bBody = z.object({
 
 r.post('/b2b-inquiries', validate(b2bBody), asyncH(async (req, res) => {
   const b = req.body;
-  const row: any = await one(
-    `INSERT INTO b2b_inquiries (business_name, phone, product, monthly_qty, city_pincode)
-     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-    [b.businessName, b.phone, b.product, b.monthlyQty, b.cityPincode],
-  );
+  const id = await nextId('b2bInquiry');
+  const row = await B2bInquiry.create({
+    id, businessName: b.businessName, phone: b.phone, product: b.product, monthlyQty: b.monthlyQty, cityPincode: b.cityPincode,
+  });
   res.status(201).json({ id: row.id, ok: true });
 }));
 

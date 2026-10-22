@@ -1,4 +1,4 @@
-import { one, query } from '../db.js';
+import { Coupon, Product } from '../models/index.js';
 import { HttpError, money } from './utils.js';
 
 const FREE_MIN = () => Number(process.env.FREE_DELIVERY_MIN || 499);
@@ -7,7 +7,7 @@ const FEE = () => Number(process.env.DELIVERY_FEE || 40);
 // Check coupon for a subtotal. Returns { coupon, discount } or throws.
 export async function applyCoupon(code: string | null | undefined, subtotal: number) {
   if (!code) return { coupon: null, discount: 0 };
-  const c: any = await one('SELECT * FROM coupons WHERE code = $1', [String(code).trim().toUpperCase()]);
+  const c = await Coupon.findOne({ code: String(code).trim().toUpperCase() }).lean();
   if (!c || !c.isActive) throw new HttpError(400, 'Invalid coupon code');
   if (c.validTill && new Date(c.validTill) < new Date()) throw new HttpError(400, 'Coupon expired');
   if (subtotal < c.minOrder) throw new HttpError(400, `Add items worth ₹${c.minOrder} to use this coupon`);
@@ -30,13 +30,19 @@ export async function priceCart(items: CartItem[], couponCode?: string | null) {
   for (const i of items) qtyById[i.variantId] = (qtyById[i.variantId] || 0) + i.qty;
   const ids = Object.keys(qtyById).map(Number);
 
-  const rows: any[] = await query(
-    `SELECT v.*, p.name_en AS product_name, p.image, p.slug
-     FROM product_variants v JOIN products p ON p.id = v.product_id
-     WHERE v.id = ANY($1) AND v.is_active AND p.is_active`,
-    [ids],
-  );
-  const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+  const products = await Product.find(
+    { 'variants.id': { $in: ids }, isActive: true },
+    { nameEn: 1, image: 1, slug: 1, variants: 1 },
+  ).lean();
+
+  const byId: Record<number, any> = {};
+  for (const p of products) {
+    for (const v of p.variants) {
+      if (v.isActive && qtyById[v.id] !== undefined) {
+        byId[v.id] = { ...v, productName: p.nameEn, image: p.image, slug: p.slug };
+      }
+    }
+  }
 
   const lines = ids.map((variantId) => {
     const v = byId[variantId];

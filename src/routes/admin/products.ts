@@ -1,11 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one, tx } from '../../db.js';
+import type { ClientSession } from 'mongoose';
+import { Product, Order } from '../../models/index.js';
 import { asyncH, HttpError } from '../../lib/utils.js';
 import { loadProducts } from '../../lib/products.js';
 import { validate } from '../../middleware/validate.js';
 import { moveStock, setStock } from '../../lib/stock.js';
-import type { TxHelpers } from '../../db.js';
+import { tx, nextId } from '../../db.js';
 
 const r = Router();
 
@@ -58,86 +59,93 @@ const productSchema = z.object({
   variants: z.array(variantSchema).min(1, 'Add at least one pack size'),
 });
 
-const COLS = `category_id, slug, name_en, name_gu, name_hi, description, highlight, origin, badge, image, is_featured, is_active,
-  scientific_name, grade, details, images, hsn_code, gst_rate`;
-const productVals = (b: any) => [b.categoryId, b.slug, b.nameEn, b.nameGu || null, b.nameHi || null, b.description || null,
-  b.highlight || null, b.origin || null, b.badge || null, b.image || null, b.isFeatured, b.isActive,
-  b.scientificName || null, b.grade || null, JSON.stringify(b.details || {}), JSON.stringify(b.images || []),
-  b.hsnCode || null, b.gstRate ?? null];
+const productSet = (b: any) => ({
+  categoryId: b.categoryId, slug: b.slug, nameEn: b.nameEn, nameGu: b.nameGu || null, nameHi: b.nameHi || null,
+  description: b.description || null, highlight: b.highlight || null, origin: b.origin || null, badge: b.badge || null,
+  image: b.image || null, isFeatured: b.isFeatured, isActive: b.isActive, scientificName: b.scientificName || null,
+  grade: b.grade || null, details: b.details || {}, images: b.images || [], hsnCode: b.hsnCode || null, gstRate: b.gstRate ?? null,
+});
 
 const autoSku = (productId: number, pack: string) => `SN-${String(productId).padStart(3, '0')}-${pack.toUpperCase().replace(/[^A-Z0-9]/g, '')}`;
 
-async function insertVariant(db: TxHelpers, productId: number, v: any, adminId: number) {
-  const row: any = await db.one(
-    `INSERT INTO product_variants (product_id, pack_size, grams, price, mrp, cost_price, stock, low_stock_threshold, sku, is_active)
-     VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$9) RETURNING id`,
-    [productId, v.packSize, v.grams, v.price, v.mrp, v.costPrice ?? null, v.lowStockThreshold, v.sku || autoSku(productId, v.packSize), v.isActive],
+async function insertVariant(session: ClientSession, productId: number, v: any, adminId: number) {
+  const variantId = await nextId('variant', session);
+  await Product.updateOne(
+    { id: productId },
+    { $push: { variants: {
+      id: variantId, packSize: v.packSize, grams: v.grams, price: v.price, mrp: v.mrp, costPrice: v.costPrice ?? null,
+      stock: 0, lowStockThreshold: v.lowStockThreshold, sku: v.sku || autoSku(productId, v.packSize), isActive: v.isActive, updatedAt: new Date(),
+    } } },
+    { session },
   );
-  if (v.stock > 0) await moveStock(db, { variantId: row.id, change: v.stock, type: 'INWARD', note: 'Opening stock', adminId });
+  if (v.stock > 0) await moveStock(session, { variantId, change: v.stock, type: 'INWARD', note: 'Opening stock', adminId });
 }
 
 r.get('/', asyncH(async (_req, res) => {
-  res.json(await loadProducts({ orderBy: 'p.created_at DESC, p.id DESC', onlyActiveVariants: false, admin: true }));
+  res.json(await loadProducts({ sort: { createdAt: -1, id: -1 }, onlyActiveVariants: false }));
 }));
 
 r.get('/:id', asyncH(async (req, res) => {
-  const [p] = await loadProducts({ where: 'p.id = $1', params: [Number(req.params.id)], onlyActiveVariants: false, admin: true });
+  const id = Number(req.params.id);
+  const [p] = await loadProducts({ filter: { id }, onlyActiveVariants: false });
   if (!p) throw new HttpError(404, 'Product not found');
-  const sold = await one(
-    `SELECT COALESCE(SUM(i.qty),0)::int AS units, COALESCE(SUM(i.line_total),0) AS revenue
-     FROM order_items i JOIN product_variants v ON v.id = i.variant_id JOIN orders o ON o.id = i.order_id
-     WHERE v.product_id = $1 AND o.status <> 'CANCELLED' AND o.created_at >= now() - interval '30 days'`,
-    [p.id],
-  );
-  res.json({ ...p, sold30: sold });
+  const variantIds = p.variants.map((v: any) => v.id);
+  const thirtyAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const [sold] = await Order.aggregate([
+    { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: thirtyAgo } } },
+    { $unwind: '$items' },
+    { $match: { 'items.variantId': { $in: variantIds } } },
+    { $group: { _id: null, units: { $sum: '$items.qty' }, revenue: { $sum: '$items.lineTotal' } } },
+  ]);
+  res.json({ ...p, sold30: { units: sold?.units || 0, revenue: sold?.revenue || 0 } });
 }));
 
 r.post('/', validate(productSchema), asyncH(async (req, res) => {
   const b = req.body;
-  const id = await tx(async (db) => {
-    if (await db.one('SELECT id FROM products WHERE slug = $1', [b.slug])) throw new HttpError(400, 'This URL (slug) is already used');
-    const p: any = await db.one(`INSERT INTO products (${COLS}) VALUES (${productVals(b).map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, productVals(b));
-    for (const v of b.variants) await insertVariant(db, p.id, v, req.admin!.id);
-    return p.id;
+  const id = await tx(async (session) => {
+    if (await Product.exists({ slug: b.slug }).session(session)) throw new HttpError(400, 'This URL (slug) is already used');
+    const productId = await nextId('product', session);
+    await Product.create([{ id: productId, variants: [], ...productSet(b) }], { session });
+    for (const v of b.variants) await insertVariant(session, productId, v, req.admin!.id);
+    return productId;
   });
-  const [p] = await loadProducts({ where: 'p.id = $1', params: [id], onlyActiveVariants: false, admin: true });
+  const [p] = await loadProducts({ filter: { id }, onlyActiveVariants: false });
   res.status(201).json(p);
 }));
 
 r.put('/:id', validate(productSchema), asyncH(async (req, res) => {
   const id = Number(req.params.id);
   const b = req.body;
-  await tx(async (db) => {
-    if (await db.one('SELECT id FROM products WHERE slug = $1 AND id <> $2', [b.slug, id])) throw new HttpError(400, 'This URL (slug) is already used');
-    const vals = productVals(b);
-    const sets = COLS.split(',').map((c, i) => `${c.trim()} = $${i + 1}`).join(', ');
-    const upd = await db.one(`UPDATE products SET ${sets}, updated_at = now() WHERE id = $${vals.length + 1} RETURNING id`, [...vals, id]);
-    if (!upd) throw new HttpError(404, 'Product not found');
+  await tx(async (session) => {
+    if (await Product.exists({ slug: b.slug, id: { $ne: id } }).session(session)) throw new HttpError(400, 'This URL (slug) is already used');
+    const current = await Product.findOne({ id }, { variants: 1 }, { session });
+    if (!current) throw new HttpError(404, 'Product not found');
+    await Product.updateOne({ id }, { $set: productSet(b) }, { session });
 
     // packs removed in the form: hide if already sold, else delete
-    const keep = b.variants.filter((v: any) => v.id).map((v: any) => v.id);
-    const removed: any[] = await db.q(
-      `SELECT v.id, EXISTS (SELECT 1 FROM order_items i WHERE i.variant_id = v.id) AS used
-       FROM product_variants v WHERE v.product_id = $1 AND NOT (v.id = ANY($2))`,
-      [id, keep],
-    );
+    const keep = new Set(b.variants.filter((v: any) => v.id).map((v: any) => v.id));
+    const removed = current.variants.filter((v) => !keep.has(v.id));
     for (const v of removed) {
-      if (v.used) await db.q('UPDATE product_variants SET is_active = false, updated_at = now() WHERE id = $1', [v.id]);
-      else await db.q('DELETE FROM product_variants WHERE id = $1', [v.id]);
+      const used = await Order.exists({ 'items.variantId': v.id }).session(session);
+      if (used) await Product.updateOne({ id, 'variants.id': v.id }, { $set: { 'variants.$.isActive': false, 'variants.$.updatedAt': new Date() } }, { session });
+      else await Product.updateOne({ id }, { $pull: { variants: { id: v.id } } }, { session });
     }
     for (const v of b.variants) {
-      if (!v.id) { await insertVariant(db, id, v, req.admin!.id); continue; }
-      const own = await db.one('SELECT id FROM product_variants WHERE id = $1 AND product_id = $2', [v.id, id]);
-      if (!own) throw new HttpError(400, 'Pack does not belong to this product');
-      await db.q(
-        `UPDATE product_variants SET pack_size=$1, grams=$2, price=$3, mrp=$4, cost_price=$5, low_stock_threshold=$6,
-           sku=$7, is_active=$8, updated_at=now() WHERE id=$9`,
-        [v.packSize, v.grams, v.price, v.mrp, v.costPrice ?? null, v.lowStockThreshold, v.sku || autoSku(id, v.packSize), v.isActive, v.id],
+      if (!v.id) { await insertVariant(session, id, v, req.admin!.id); continue; }
+      if (!current.variants.some((x) => x.id === v.id)) throw new HttpError(400, 'Pack does not belong to this product');
+      await Product.updateOne(
+        { id, 'variants.id': v.id },
+        { $set: {
+          'variants.$.packSize': v.packSize, 'variants.$.grams': v.grams, 'variants.$.price': v.price, 'variants.$.mrp': v.mrp,
+          'variants.$.costPrice': v.costPrice ?? null, 'variants.$.lowStockThreshold': v.lowStockThreshold,
+          'variants.$.sku': v.sku || autoSku(id, v.packSize), 'variants.$.isActive': v.isActive, 'variants.$.updatedAt': new Date(),
+        } },
+        { session },
       );
-      await setStock(db, { variantId: v.id, value: v.stock, type: 'EDIT', note: 'Changed in product form', adminId: req.admin!.id });
+      await setStock(session, { variantId: v.id, value: v.stock, type: 'EDIT', note: 'Changed in product form', adminId: req.admin!.id });
     }
   });
-  const [p] = await loadProducts({ where: 'p.id = $1', params: [id], onlyActiveVariants: false, admin: true });
+  const [p] = await loadProducts({ filter: { id }, onlyActiveVariants: false });
   res.json(p);
 }));
 
@@ -145,17 +153,16 @@ r.put('/:id', validate(productSchema), asyncH(async (req, res) => {
 r.patch('/bulk', validate(z.object({ ids: z.array(z.number().int()).min(1).max(200), isActive: z.boolean().optional(), isFeatured: z.boolean().optional() })), asyncH(async (req, res) => {
   const { ids, isActive, isFeatured } = req.body;
   if (isActive === undefined && isFeatured === undefined) throw new HttpError(400, 'Nothing to change');
-  const rows = await query(
-    `UPDATE products SET is_active = COALESCE($2, is_active), is_featured = COALESCE($3, is_featured), updated_at = now()
-     WHERE id = ANY($1) RETURNING id`,
-    [ids, isActive ?? null, isFeatured ?? null],
-  );
-  res.json({ updated: rows.length });
+  const set: Record<string, any> = {};
+  if (isActive !== undefined) set.isActive = isActive;
+  if (isFeatured !== undefined) set.isFeatured = isFeatured;
+  const result = await Product.updateMany({ id: { $in: ids } }, { $set: set });
+  res.json({ updated: result.modifiedCount });
 }));
 
 // Soft delete keeps order history safe
 r.delete('/:id', asyncH(async (req, res) => {
-  await query('UPDATE products SET is_active = false, updated_at = now() WHERE id = $1', [Number(req.params.id)]);
+  await Product.updateOne({ id: Number(req.params.id) }, { $set: { isActive: false } });
   res.json({ ok: true });
 }));
 

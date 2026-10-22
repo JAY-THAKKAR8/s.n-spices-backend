@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one, tx } from '../../db.js';
+import { Order, OrderItemDoc, Product, Category, Customer, Coupon, Admin } from '../../models/index.js';
 import { asyncH, HttpError } from '../../lib/utils.js';
 import { validate } from '../../middleware/validate.js';
 import { moveStock, addOrderEvent } from '../../lib/stock.js';
 import { getSettings } from '../../lib/settings.js';
+import { tx, nextId } from '../../db.js';
 
 const r = Router();
 
@@ -14,54 +15,62 @@ const LABEL: Record<string, string> = {
   OUT_FOR_DELIVERY: 'Out for delivery', DELIVERED: 'Delivered', CANCELLED: 'Cancelled',
 };
 
-// Build WHERE for list + export
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const rangeStart = (range: string) => {
+  const now = new Date();
+  if (range === 'today') return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  if (range === 'week') return new Date(Date.now() - 6 * 24 * 60 * 60 * 1000);
+  if (range === 'month') return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  return null;
+};
+
+// Build Mongo filter for list + export
 function orderFilter(qs: Record<string, any>) {
-  const conds: string[] = [];
-  const params: any[] = [];
-  const add = (v: any) => { params.push(v); return `$${params.length}`; };
-  if (qs.status && (STATUSES as readonly string[]).includes(qs.status)) conds.push(`o.status = ${add(qs.status)}`);
-  if (qs.payment === 'COD' || qs.payment === 'WHATSAPP') conds.push(`o.payment_method = ${add(qs.payment)}`);
-  if (qs.paid === 'PAID' || qs.paid === 'UNPAID') conds.push(`o.payment_status = ${add(qs.paid)}`);
-  if (qs.range === 'today') conds.push('o.created_at >= CURRENT_DATE');
-  if (qs.range === 'week') conds.push("o.created_at >= CURRENT_DATE - interval '6 days'");
-  if (qs.range === 'month') conds.push("o.created_at >= date_trunc('month', now())");
-  if (qs.customerId) conds.push(`o.customer_id = ${add(Number(qs.customerId))}`);
+  const f: Record<string, any> = {};
+  if (qs.status && (STATUSES as readonly string[]).includes(qs.status)) f.status = qs.status;
+  if (qs.payment === 'COD' || qs.payment === 'WHATSAPP') f.paymentMethod = qs.payment;
+  if (qs.paid === 'PAID' || qs.paid === 'UNPAID') f.paymentStatus = qs.paid;
+  const since = qs.range && rangeStart(qs.range);
+  if (since) f.createdAt = { $gte: since };
+  if (qs.customerId) f.customerId = Number(qs.customerId);
   if (qs.q) {
-    const p = add(`%${String(qs.q).trim()}%`);
-    conds.push(`(o.order_no ILIKE ${p} OR o.phone ILIKE ${p} OR o.name ILIKE ${p} OR o.city ILIKE ${p})`);
+    const re = new RegExp(escapeRe(String(qs.q).trim()), 'i');
+    f.$or = [{ orderNo: re }, { phone: re }, { name: re }, { city: re }];
   }
-  return { where: conds.length ? conds.join(' AND ') : 'TRUE', params };
+  return f;
 }
 
-const LIST_SQL = (where: string, extra = '') => `
-  SELECT o.*,
-    (SELECT COUNT(*)::int FROM order_items i WHERE i.order_id = o.id) AS line_count,
-    (SELECT COALESCE(SUM(i.qty),0)::int FROM order_items i WHERE i.order_id = o.id) AS unit_count,
-    (SELECT string_agg(i.name || ' ' || i.pack_size, ', ' ORDER BY i.id) FROM order_items i WHERE i.order_id = o.id) AS items_text
-  FROM orders o WHERE ${where} ORDER BY o.created_at DESC ${extra}`;
+const withSummary = (o: any) => ({
+  ...o,
+  lineCount: o.items.length,
+  unitCount: o.items.reduce((s: number, i: OrderItemDoc) => s + i.qty, 0),
+  itemsText: o.items.map((i: OrderItemDoc) => `${i.name} ${i.packSize}`).join(', '),
+  items: undefined,
+  events: undefined,
+});
 
 // List with pagination + counts per status (counts ignore the status filter)
 r.get('/', asyncH(async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 15));
-  const { where, params } = orderFilter(req.query);
-  const { where: cw, params: cp } = orderFilter({ ...req.query, status: undefined });
+  const filter = orderFilter(req.query);
+  const countFilter = orderFilter({ ...req.query, status: undefined });
 
-  const [items, total, counts] = await Promise.all([
-    query(LIST_SQL(where, `LIMIT ${limit} OFFSET ${(page - 1) * limit}`), params),
-    one<{ n: number }>(`SELECT COUNT(*)::int AS n FROM orders o WHERE ${where}`, params),
-    query<{ status: string; n: number }>(`SELECT o.status, COUNT(*)::int AS n FROM orders o WHERE ${cw} GROUP BY o.status`, cp),
+  const [rows, total, counts] = await Promise.all([
+    Order.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Order.countDocuments(filter),
+    Order.aggregate([{ $match: countFilter }, { $group: { _id: '$status', n: { $sum: 1 } } }]),
   ]);
   const byStatus: Record<string, number> = Object.fromEntries(STATUSES.map((s) => [s, 0]));
   let all = 0;
-  for (const c of counts) { byStatus[c.status] = c.n; all += c.n; }
-  res.json({ items, total: total!.n, page, pages: Math.max(1, Math.ceil(total!.n / limit)), counts: { ALL: all, ...byStatus } });
+  for (const c of counts) { byStatus[c._id] = c.n; all += c.n; }
+  res.json({ items: rows.map(withSummary), total, page, pages: Math.max(1, Math.ceil(total / limit)), counts: { ALL: all, ...byStatus } });
 }));
 
 // CSV export (same filters)
 r.get('/export.csv', asyncH(async (req, res) => {
-  const { where, params } = orderFilter(req.query);
-  const rows: any[] = await query(LIST_SQL(where, 'LIMIT 5000'), params);
+  const filter = orderFilter(req.query);
+  const rows = (await Order.find(filter).sort({ createdAt: -1 }).limit(5000).lean()).map(withSummary);
   const esc = (v: any) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const head = ['Order No', 'Date', 'Customer', 'Phone', 'City', 'Pincode', 'Items', 'Subtotal', 'Discount', 'Delivery', 'Total', 'Payment', 'Paid', 'Status', 'Courier', 'Tracking'];
   const lines = rows.map((o) => [
@@ -76,37 +85,49 @@ r.get('/export.csv', asyncH(async (req, res) => {
 // Full order: items (with product photo + category), timeline, customer summary, seller info for invoice
 r.get('/:id', asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  const o: any = await one('SELECT * FROM orders WHERE id = $1', [id]);
+  const o = await Order.findOne({ id }).lean();
   if (!o) throw new HttpError(404, 'Order not found');
-  const [items, events, cust, coupon, settings] = await Promise.all([
-    query(`SELECT i.*, v.sku, v.grams, p.id AS product_id, p.slug, p.image, p.hsn_code, p.gst_rate, c.name_en AS category, c.slug AS category_slug
-           FROM order_items i
-           JOIN product_variants v ON v.id = i.variant_id
-           JOIN products p ON p.id = v.product_id
-           JOIN categories c ON c.id = p.category_id
-           WHERE i.order_id = $1 ORDER BY i.id`, [id]),
-    query(`SELECT e.*, a.name AS admin_name FROM order_events e LEFT JOIN admins a ON a.id = e.admin_id
-           WHERE e.order_id = $1 ORDER BY e.created_at, e.id`, [id]),
-    one(`SELECT c.id, c.name, c.phone, c.email, c.note, c.created_at,
-           COUNT(x.id) FILTER (WHERE x.status <> 'CANCELLED')::int AS order_count,
-           COALESCE(SUM(x.total) FILTER (WHERE x.status <> 'CANCELLED'), 0) AS total_spent
-         FROM customers c LEFT JOIN orders x ON x.customer_id = c.id
-         WHERE c.id = $1 GROUP BY c.id`, [o.customerId]),
-    o.couponId ? one('SELECT code, type, value FROM coupons WHERE id = $1', [o.couponId]) : null,
+
+  const variantIds = o.items.map((i) => i.variantId);
+  const [products, adminIds, cust, coupon, settings] = await Promise.all([
+    Product.find({ 'variants.id': { $in: variantIds } }, { id: 1, slug: 1, image: 1, hsnCode: 1, gstRate: 1, categoryId: 1, variants: 1 }).lean(),
+    Admin.find({}, { id: 1, name: 1 }).lean(),
+    Customer.findOne({ id: o.customerId }).lean(),
+    o.couponId ? Coupon.findOne({ id: o.couponId }, { code: 1, type: 1, value: 1 }).lean() : null,
     getSettings(),
   ]);
-  const position = await one<{ n: number }>(
-    `SELECT COUNT(*)::int AS n FROM orders WHERE customer_id = $1 AND created_at <= $2 AND status <> 'CANCELLED'`,
-    [o.customerId, o.createdAt],
-  );
-  const weight = items.reduce((g: number, i: any) => g + (i.grams || 0) * i.qty, 0);
+  const categories = await Category.find({}, { id: 1, nameEn: 1, slug: 1 }).lean();
+  const catById = new Map(categories.map((c) => [c.id, c]));
+  const adminById = new Map(adminIds.map((a) => [a.id, a.name]));
+
+  const variantInfo = new Map<number, any>();
+  for (const p of products) {
+    const cat = catById.get(p.categoryId);
+    for (const v of p.variants) {
+      variantInfo.set(v.id, { sku: v.sku, grams: v.grams, productId: p.id, slug: p.slug, image: p.image, hsnCode: p.hsnCode, gstRate: p.gstRate, category: cat?.nameEn, categorySlug: cat?.slug });
+    }
+  }
+  const items = o.items.map((i) => ({ ...i, ...(variantInfo.get(i.variantId) || {}) }));
+  const events = o.events.map((e) => ({ ...e, adminName: e.adminId ? adminById.get(e.adminId) : undefined }));
+
+  const [orderCount, totalSpent] = cust
+    ? await Promise.all([
+        Order.countDocuments({ customerId: cust.id, status: { $ne: 'CANCELLED' } }),
+        Order.aggregate([{ $match: { customerId: cust.id, status: { $ne: 'CANCELLED' } } }, { $group: { _id: null, sum: { $sum: '$total' } } }]).then((r) => r[0]?.sum || 0),
+      ])
+    : [0, 0];
+  const position = cust
+    ? await Order.countDocuments({ customerId: cust.id, createdAt: { $lte: o.createdAt }, status: { $ne: 'CANCELLED' } })
+    : 0;
+
+  const weightGrams = items.reduce((g, i) => g + (i.grams || 0) * i.qty, 0);
   res.json({
     ...o,
     items,
     events,
-    customer: { ...cust, orderPosition: position!.n },
+    customer: cust ? { ...cust, orderCount, totalSpent, orderPosition: position } : null,
     coupon,
-    weightGrams: weight,
+    weightGrams,
     seller: { name: settings.storeName, address: settings.storeAddress, phone: settings.storePhone, gstin: settings.gstin, fssai: settings.fssai, email: settings.storeEmail },
   });
 }));
@@ -124,52 +145,51 @@ r.patch('/:id', validate(patchBody), asyncH(async (req, res) => {
   const id = Number(req.params.id);
   const adminId = req.admin!.id;
   const b = req.body;
-  await tx(async (db) => {
-    const old: any = await db.one('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [id]);
+  await tx(async (session) => {
+    const old = await Order.findOne({ id }, {}, { session });
     if (!old) throw new HttpError(404, 'Order not found');
 
     if (b.status && b.status !== old.status) {
       if (old.status === 'CANCELLED') throw new HttpError(400, 'Cancelled order cannot be reopened. Place a new order.');
       if (old.status === 'DELIVERED' && b.status !== 'CANCELLED') throw new HttpError(400, 'Order is already delivered.');
       if (b.status === 'CANCELLED') {
-        const items: any[] = await db.q('SELECT variant_id, qty FROM order_items WHERE order_id = $1', [id]);
-        for (const it of items) {
-          await moveStock(db, { variantId: it.variantId, change: it.qty, type: 'CANCEL', orderId: id, adminId, note: `${old.orderNo} cancelled` });
+        for (const it of old.items) {
+          await moveStock(session, { variantId: it.variantId, change: it.qty, type: 'CANCEL', orderId: id, adminId, note: `${old.orderNo} cancelled` });
         }
       }
-      await db.q('UPDATE orders SET status = $2, updated_at = now() WHERE id = $1', [id, b.status]);
-      await addOrderEvent(db, { orderId: id, kind: 'STATUS', status: b.status, message: b.note || null, adminId });
+      old.status = b.status;
+      await old.save({ session });
+      await addOrderEvent(session, { orderId: id, kind: 'STATUS', status: b.status, message: b.note || null, adminId });
       // cash collected on delivery
       if (b.status === 'DELIVERED' && old.paymentMethod === 'COD' && old.paymentStatus === 'UNPAID' && !b.paymentStatus) {
-        await db.q("UPDATE orders SET payment_status = 'PAID' WHERE id = $1", [id]);
-        await addOrderEvent(db, { orderId: id, kind: 'PAYMENT', status: 'PAID', message: 'Cash collected on delivery', adminId });
+        await Order.updateOne({ id }, { $set: { paymentStatus: 'PAID' } }, { session });
+        await addOrderEvent(session, { orderId: id, kind: 'PAYMENT', status: 'PAID', message: 'Cash collected on delivery', adminId });
       }
     }
     if (b.paymentStatus && b.paymentStatus !== old.paymentStatus) {
-      await db.q('UPDATE orders SET payment_status = $2, updated_at = now() WHERE id = $1', [id, b.paymentStatus]);
-      await addOrderEvent(db, { orderId: id, kind: 'PAYMENT', status: b.paymentStatus, message: b.note || null, adminId });
+      await Order.updateOne({ id }, { $set: { paymentStatus: b.paymentStatus } }, { session });
+      await addOrderEvent(session, { orderId: id, kind: 'PAYMENT', status: b.paymentStatus, message: b.note || null, adminId });
     }
     if (b.courier !== undefined || b.trackingNo !== undefined) {
       const courier = b.courier === undefined ? old.courier : b.courier || null;
       const tracking = b.trackingNo === undefined ? old.trackingNo : b.trackingNo || null;
       if (courier !== old.courier || tracking !== old.trackingNo) {
-        await db.q('UPDATE orders SET courier = $2, tracking_no = $3, updated_at = now() WHERE id = $1', [id, courier, tracking]);
-        await addOrderEvent(db, { orderId: id, kind: 'SHIPPING', message: [courier, tracking].filter(Boolean).join(' • ') || 'Shipping info removed', adminId });
+        await Order.updateOne({ id }, { $set: { courier, trackingNo: tracking } }, { session });
+        await addOrderEvent(session, { orderId: id, kind: 'SHIPPING', message: [courier, tracking].filter(Boolean).join(' • ') || 'Shipping info removed', adminId });
       }
     }
   });
-  res.json(await one('SELECT * FROM orders WHERE id = $1', [id]));
+  res.json(await Order.findOne({ id }).lean());
 }));
 
 // Internal note (staff only)
 r.post('/:id/notes', validate(z.object({ message: z.string().trim().min(1).max(500) })), asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  if (!(await one('SELECT id FROM orders WHERE id = $1', [id]))) throw new HttpError(404, 'Order not found');
-  const e: any = await one(
-    `INSERT INTO order_events (order_id, kind, message, admin_id) VALUES ($1, 'NOTE', $2, $3) RETURNING *`,
-    [id, req.body.message, req.admin!.id],
-  );
-  res.status(201).json({ ...e, adminName: req.admin!.name });
+  if (!(await Order.exists({ id }))) throw new HttpError(404, 'Order not found');
+  const eventId = await nextId('orderEvent');
+  const createdAt = new Date();
+  await Order.updateOne({ id }, { $push: { events: { id: eventId, kind: 'NOTE', message: req.body.message, adminId: req.admin!.id, createdAt } } });
+  res.status(201).json({ id: eventId, orderId: id, kind: 'NOTE', message: req.body.message, adminId: req.admin!.id, createdAt, adminName: req.admin!.name });
 }));
 
 export default r;

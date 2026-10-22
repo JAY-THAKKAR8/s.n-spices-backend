@@ -1,48 +1,46 @@
-import pg from 'pg';
+import mongoose, { ClientSession } from 'mongoose';
+import { Counter } from './models/Counter.js';
 
-// NUMERIC comes back as string by default. Make it a JS number (fine for ₹ amounts).
-pg.types.setTypeParser(1700, (v: string | null) => (v === null ? null : parseFloat(v)));
-
-export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-
-// snake_case row -> camelCase object
-const camel = (s: string) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-export const toCamel = (row: Record<string, any> | null): any => {
-  if (!row) return row;
-  const out: Record<string, any> = {};
-  for (const k of Object.keys(row)) out[camel(k)] = row[k];
-  return out;
-};
-
-export async function query<T = any>(text: string, params?: any[]): Promise<T[]> {
-  const r = await pool.query(text, params);
-  return r.rows.map(toCamel);
+// MONGODB_URI keeps <db_username>/<db_password> placeholders; the real
+// credentials live in their own env vars and get swapped in here.
+function buildConnectionString(): string {
+  const uri = process.env.MONGODB_URI as string;
+  const username = encodeURIComponent(process.env.MONGODB_USERNAME || '');
+  const password = encodeURIComponent(process.env.MONGODB_PASSWORD || '');
+  return uri.replace('<db_username>', username).replace('<db_password>', password);
 }
 
-export async function one<T = any>(text: string, params?: any[]): Promise<T | null> {
-  const rows = await query<T>(text, params);
-  return rows[0] || null;
+export async function connectDB() {
+  mongoose.set('strictQuery', true);
+  await mongoose.connect(buildConnectionString());
+  return mongoose.connection;
 }
 
-export interface TxHelpers {
-  q: <T = any>(text: string, params?: any[]) => Promise<T[]>;
-  one: <T = any>(text: string, params?: any[]) => Promise<T | null>;
+export async function disconnectDB() {
+  await mongoose.disconnect();
 }
 
-// Run fn inside BEGIN/COMMIT. fn gets a client with q() and one() helpers.
-export async function tx<T>(fn: (db: TxHelpers) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  const q = async <R = any>(t: string, p?: any[]) => (await client.query(t, p)).rows.map(toCamel) as R[];
-  const o = async <R = any>(t: string, p?: any[]) => (await q<R>(t, p))[0] || null;
+// Mints the next sequential id for a collection (admins, products, variants, ...).
+// Pass the active session so the allocation is part of the same transaction.
+export async function nextId(name: string, session?: ClientSession): Promise<number> {
+  const row = await Counter.findByIdAndUpdate(
+    name,
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, session },
+  );
+  return row!.seq;
+}
+
+// Run fn inside a Mongo transaction. fn gets the session to pass into model calls.
+export async function tx<T>(fn: (session: ClientSession) => Promise<T>): Promise<T> {
+  const session = await mongoose.startSession();
   try {
-    await client.query('BEGIN');
-    const res = await fn({ q, one: o });
-    await client.query('COMMIT');
-    return res;
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
+    let result: T;
+    await session.withTransaction(async () => {
+      result = await fn(session);
+    });
+    return result!;
   } finally {
-    client.release();
+    await session.endSession();
   }
 }

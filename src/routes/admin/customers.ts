@@ -1,51 +1,56 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one } from '../../db.js';
+import { Customer, Order } from '../../models/index.js';
 import { asyncH, HttpError } from '../../lib/utils.js';
 import { validate } from '../../middleware/validate.js';
 import { getSettings } from '../../lib/settings.js';
+import { nextId } from '../../db.js';
 
 const r = Router();
 
-// One row per customer with order stats (cancelled orders not counted)
-const BASE = `
-  WITH stats AS (
-    SELECT c.id, c.name, c.phone, c.email, c.note, c.created_at,
-      COUNT(o.id) FILTER (WHERE o.status <> 'CANCELLED')::int AS order_count,
-      COALESCE(SUM(o.total) FILTER (WHERE o.status <> 'CANCELLED'), 0) AS total_spent,
-      MAX(o.created_at) AS last_order_at,
-      (ARRAY_AGG(o.order_no ORDER BY o.created_at DESC))[1] AS last_order_no,
-      (ARRAY_AGG(o.id ORDER BY o.created_at DESC))[1] AS last_order_id,
-      (ARRAY_AGG(o.city ORDER BY o.created_at DESC))[1] AS city,
-      (ARRAY_AGG(o.pincode ORDER BY o.created_at DESC))[1] AS pincode
-    FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
-    GROUP BY c.id
-  )`;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-const SORTS: Record<string, string> = {
-  spent_desc: 'total_spent DESC, id DESC',
-  spent_asc: 'total_spent ASC, id DESC',
-  recent: 'last_order_at DESC NULLS LAST, id DESC',
-  orders_desc: 'order_count DESC, total_spent DESC',
-  name: 'name ASC',
-  newest: 'created_at DESC',
+// Joins each customer to its orders and rolls up order stats (cancelled orders not counted).
+const STATS_PIPELINE: any[] = [
+  { $lookup: { from: 'orders', localField: 'id', foreignField: 'customerId', as: 'orders' } },
+  { $addFields: {
+    liveOrders: { $filter: { input: '$orders', as: 'o', cond: { $ne: ['$$o.status', 'CANCELLED'] } } },
+    sortedOrders: { $sortArray: { input: '$orders', sortBy: { createdAt: -1 } } },
+  } },
+  { $addFields: {
+    orderCount: { $size: '$liveOrders' },
+    totalSpent: { $sum: '$liveOrders.total' },
+    lastOrderAt: { $arrayElemAt: ['$sortedOrders.createdAt', 0] },
+    lastOrderNo: { $arrayElemAt: ['$sortedOrders.orderNo', 0] },
+    lastOrderId: { $arrayElemAt: ['$sortedOrders.id', 0] },
+    city: { $arrayElemAt: ['$sortedOrders.city', 0] },
+    pincode: { $arrayElemAt: ['$sortedOrders.pincode', 0] },
+  } },
+  { $project: { orders: 0, liveOrders: 0, sortedOrders: 0 } },
+];
+
+const SORTS: Record<string, Record<string, 1 | -1>> = {
+  spent_desc: { totalSpent: -1, id: -1 },
+  spent_asc: { totalSpent: 1, id: -1 },
+  recent: { lastOrderAt: -1, id: -1 },
+  orders_desc: { orderCount: -1, totalSpent: -1 },
+  name: { name: 1 },
+  newest: { createdAt: -1 },
 };
 
-function filters(qs: Record<string, any>, vip: number) {
-  const conds: string[] = [];
-  const params: any[] = [];
-  const add = (v: any) => { params.push(v); return `$${params.length}`; };
+function filterMatch(qs: Record<string, any>, vip: number) {
+  const match: Record<string, any> = {};
   if (qs.q) {
-    const p = add(`%${String(qs.q).trim()}%`);
-    conds.push(`(name ILIKE ${p} OR phone ILIKE ${p} OR email ILIKE ${p} OR city ILIKE ${p})`);
+    const re = new RegExp(escapeRe(String(qs.q).trim()), 'i');
+    match.$or = [{ name: re }, { phone: re }, { email: re }, { city: re }];
   }
-  if (qs.city) conds.push(`city ILIKE ${add(qs.city)}`);
-  if (qs.segment === 'repeat') conds.push('order_count >= 2');
-  if (qs.segment === 'first') conds.push('order_count = 1');
-  if (qs.segment === 'vip') conds.push(`total_spent >= ${add(vip)}`);
-  if (qs.segment === 'inactive') conds.push("last_order_at < now() - interval '90 days'");
-  if (qs.segment === 'none') conds.push('order_count = 0');
-  return { where: conds.length ? conds.join(' AND ') : 'TRUE', params };
+  if (qs.city) match.city = new RegExp(`^${escapeRe(String(qs.city))}$`, 'i');
+  if (qs.segment === 'repeat') match.orderCount = { $gte: 2 };
+  if (qs.segment === 'first') match.orderCount = 1;
+  if (qs.segment === 'vip') match.totalSpent = { $gte: vip };
+  if (qs.segment === 'inactive') match.lastOrderAt = { $lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) };
+  if (qs.segment === 'none') match.orderCount = 0;
+  return match;
 }
 
 r.get('/', asyncH(async (req, res) => {
@@ -53,34 +58,52 @@ r.get('/', asyncH(async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 15));
   const sort = SORTS[req.query.sort as string] || SORTS.spent_desc;
-  const { where, params } = filters(req.query, vipSpend);
+  const match = filterMatch(req.query, vipSpend);
+  const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
+  const ninetyAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
-  const [items, total, kpis, segs, cities] = await Promise.all([
-    query(`${BASE} SELECT * FROM stats WHERE ${where} ORDER BY ${sort} LIMIT ${limit} OFFSET ${(page - 1) * limit}`, params),
-    one<{ n: number }>(`${BASE} SELECT COUNT(*)::int AS n FROM stats WHERE ${where}`, params),
-    one(`${BASE} SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE created_at >= date_trunc('month', now()))::int AS new_month,
-        COUNT(*) FILTER (WHERE order_count >= 2)::int AS repeat,
-        COUNT(*) FILTER (WHERE order_count >= 1)::int AS buyers,
-        COALESCE(SUM(total_spent) / NULLIF(SUM(order_count), 0), 0) AS aov
-      FROM stats`),
-    one(`${BASE} SELECT
-        COUNT(*)::int AS all,
-        COUNT(*) FILTER (WHERE order_count >= 2)::int AS repeat,
-        COUNT(*) FILTER (WHERE total_spent >= $1)::int AS vip,
-        COUNT(*) FILTER (WHERE order_count = 1)::int AS first,
-        COUNT(*) FILTER (WHERE last_order_at < now() - interval '90 days')::int AS inactive
-      FROM stats`, [vipSpend]),
-    query(`SELECT city, COUNT(DISTINCT customer_id)::int AS n FROM orders GROUP BY city ORDER BY n DESC LIMIT 20`),
+  const [items, totalRows, kpiRows, segRows, cities] = await Promise.all([
+    Customer.aggregate([...STATS_PIPELINE, { $match: match }, { $sort: sort }, { $skip: (page - 1) * limit }, { $limit: limit }]),
+    Customer.aggregate([...STATS_PIPELINE, { $match: match }, { $count: 'n' }]),
+    Customer.aggregate([...STATS_PIPELINE, { $group: {
+      _id: null,
+      total: { $sum: 1 },
+      newMonth: { $sum: { $cond: [{ $gte: ['$createdAt', monthStart] }, 1, 0] } },
+      repeat: { $sum: { $cond: [{ $gte: ['$orderCount', 2] }, 1, 0] } },
+      buyers: { $sum: { $cond: [{ $gte: ['$orderCount', 1] }, 1, 0] } },
+      spentSum: { $sum: '$totalSpent' },
+      orderSum: { $sum: '$orderCount' },
+    } }]),
+    Customer.aggregate([...STATS_PIPELINE, { $group: {
+      _id: null,
+      all: { $sum: 1 },
+      repeat: { $sum: { $cond: [{ $gte: ['$orderCount', 2] }, 1, 0] } },
+      vip: { $sum: { $cond: [{ $gte: ['$totalSpent', vipSpend] }, 1, 0] } },
+      first: { $sum: { $cond: [{ $eq: ['$orderCount', 1] }, 1, 0] } },
+      inactive: { $sum: { $cond: [{ $lt: ['$lastOrderAt', ninetyAgo] }, 1, 0] } },
+    } }]),
+    Order.aggregate([
+      { $group: { _id: '$city', customers: { $addToSet: '$customerId' } } },
+      { $project: { _id: 0, city: '$_id', n: { $size: '$customers' } } },
+      { $sort: { n: -1 } },
+      { $limit: 20 },
+    ]),
   ]);
-  res.json({ items, total: total!.n, page, pages: Math.max(1, Math.ceil(total!.n / limit)), kpis, segments: segs, cities, vipSpend });
+  const total = totalRows[0]?.n || 0;
+  const k = kpiRows[0];
+  const s = segRows[0];
+  res.json({
+    items, total, page, pages: Math.max(1, Math.ceil(total / limit)),
+    kpis: k ? { total: k.total, newMonth: k.newMonth, repeat: k.repeat, buyers: k.buyers, aov: k.orderSum ? k.spentSum / k.orderSum : 0 } : { total: 0, newMonth: 0, repeat: 0, buyers: 0, aov: 0 },
+    segments: s ? { all: s.all, repeat: s.repeat, vip: s.vip, first: s.first, inactive: s.inactive } : { all: 0, repeat: 0, vip: 0, first: 0, inactive: 0 },
+    cities, vipSpend,
+  });
 }));
 
 r.get('/export.csv', asyncH(async (req, res) => {
   const { vipSpend } = await getSettings();
-  const { where, params } = filters(req.query, vipSpend);
-  const rows: any[] = await query(`${BASE} SELECT * FROM stats WHERE ${where} ORDER BY total_spent DESC LIMIT 10000`, params);
+  const match = filterMatch(req.query, vipSpend);
+  const rows = await Customer.aggregate([...STATS_PIPELINE, { $match: match }, { $sort: { totalSpent: -1 } }, { $limit: 10000 }]);
   const esc = (x: any) => `"${String(x ?? '').replace(/"/g, '""')}"`;
   const head = ['Name', 'Phone', 'Email', 'City', 'Pincode', 'Orders', 'Total spent', 'Last order', 'Last order date', 'Customer since'];
   const d = (x: any) => (x ? new Date(x).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }) : '');
@@ -92,16 +115,22 @@ r.get('/export.csv', asyncH(async (req, res) => {
 
 r.get('/:id', asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  const c: any = await one(`${BASE} SELECT * FROM stats WHERE id = $1`, [id]);
+  const [c] = await Customer.aggregate([{ $match: { id } }, ...STATS_PIPELINE]);
   if (!c) throw new HttpError(404, 'Customer not found');
   const [orders, favourites] = await Promise.all([
-    query<any>(`SELECT id, order_no, total, status, payment_status, payment_method, created_at, address, city, pincode,
-             (SELECT COUNT(*)::int FROM order_items i WHERE i.order_id = o.id) AS line_count
-           FROM orders o WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50`, [id]),
-    query(`SELECT i.name, SUM(i.qty)::int AS qty FROM order_items i JOIN orders o ON o.id = i.order_id
-           WHERE o.customer_id = $1 AND o.status <> 'CANCELLED' GROUP BY i.name ORDER BY qty DESC LIMIT 5`, [id]),
+    Order.find({ customerId: id }, { id: 1, orderNo: 1, total: 1, status: 1, paymentStatus: 1, paymentMethod: 1, createdAt: 1, address: 1, city: 1, pincode: 1, items: 1 })
+      .sort({ createdAt: -1 }).limit(50).lean(),
+    Order.aggregate([
+      { $match: { customerId: id, status: { $ne: 'CANCELLED' } } },
+      { $unwind: '$items' },
+      { $group: { _id: '$items.name', qty: { $sum: '$items.qty' } } },
+      { $sort: { qty: -1 } },
+      { $limit: 5 },
+      { $project: { _id: 0, name: '$_id', qty: 1 } },
+    ]),
   ]);
-  res.json({ ...c, orders, favourites, lastAddress: orders[0] ? `${orders[0].address}, ${orders[0].city} - ${orders[0].pincode}` : null });
+  const ordersOut = orders.map((o) => ({ ...o, lineCount: o.items.length, items: undefined }));
+  res.json({ ...c, orders: ordersOut, favourites, lastAddress: ordersOut[0] ? `${ordersOut[0].address}, ${ordersOut[0].city} - ${ordersOut[0].pincode}` : null });
 }));
 
 const custBody = z.object({
@@ -113,18 +142,16 @@ const custBody = z.object({
 
 r.post('/', validate(custBody), asyncH(async (req, res) => {
   const b = req.body;
-  if (await one('SELECT id FROM customers WHERE phone = $1', [b.phone])) throw new HttpError(400, 'A customer with this phone already exists');
-  res.status(201).json(await one(
-    'INSERT INTO customers (name, phone, email, note) VALUES ($1,$2,$3,$4) RETURNING *',
-    [b.name, b.phone, b.email || null, b.note || null],
-  ));
+  if (await Customer.exists({ phone: b.phone })) throw new HttpError(400, 'A customer with this phone already exists');
+  const id = await nextId('customer');
+  res.status(201).json(await Customer.create({ id, name: b.name, phone: b.phone, email: b.email || null, note: b.note || null }));
 }));
 
 r.put('/:id', validate(custBody), asyncH(async (req, res) => {
   const b = req.body;
   const id = Number(req.params.id);
-  if (await one('SELECT id FROM customers WHERE phone = $1 AND id <> $2', [b.phone, id])) throw new HttpError(400, 'Another customer has this phone');
-  const row = await one('UPDATE customers SET name=$1, phone=$2, email=$3, note=$4 WHERE id=$5 RETURNING *', [b.name, b.phone, b.email || null, b.note || null, id]);
+  if (await Customer.exists({ phone: b.phone, id: { $ne: id } })) throw new HttpError(400, 'Another customer has this phone');
+  const row = await Customer.findOneAndUpdate({ id }, { $set: { name: b.name, phone: b.phone, email: b.email || null, note: b.note || null } }, { new: true });
   if (!row) throw new HttpError(404, 'Customer not found');
   res.json(row);
 }));
